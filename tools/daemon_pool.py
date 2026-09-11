@@ -36,8 +36,14 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         return super().submit(_run_with_context, *args, **kwargs)
 
     def _adjust_thread_count(self) -> None:
-        # Mirrors CPython's implementation (3.8–3.13) with two changes:
-        # daemon=True and no _threads_queues registration.
+        # Mirrors CPython's implementation with two changes: daemon=True and no
+        # _threads_queues registration. The worker argument list differs by
+        # stdlib version: 3.14 replaced ``self._initializer``/``_initargs`` with
+        # a per-worker context object from ``self._create_worker_context()``,
+        # and 3.14's ``_worker`` takes it as its second argument. Select the
+        # stdlib shape at runtime so one file serves every interpreter the venv
+        # may run on (a 3.14-only file dead on a 3.13 venv and vice versa —
+        # the regression that killed every tool with AttributeError).
         if self._idle_semaphore.acquire(timeout=0):
             return
 
@@ -46,11 +52,23 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            if hasattr(self, "_create_worker_context"):
+                worker_args = (
+                    weakref.ref(self, weakref_cb),
+                    getattr(self, "_create_worker_context")(),
+                    self._work_queue,
+                )
+            else:
+                worker_args = (
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                )
             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
             # right profile (#54937).
             t = threading.Thread(
-                name=thread_name, target=_worker, daemon=True,
-                args=(weakref.ref(self, weakref_cb), self._work_queue, self._initializer, self._initargs),
+                name=thread_name, target=_worker, daemon=True, args=worker_args,
             )
             t.start()
             self._threads.add(t)
