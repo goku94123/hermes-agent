@@ -1770,7 +1770,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             # ZELDA FORK: outbound file push (Hermes → Sinda). Read-only static serving of
             # ~/.hermes/zelda-outbound/ — Hermes writes files there, the fork GETs them.
-            ("GET", "/v1/zelda/files/{name}", self._handle_zelda_file)]
+            ("GET", "/v1/zelda/files/{name}", self._handle_zelda_file),
+            # ZELDA FORK: native push queue — the fork polls GET /v1/zelda/push for staged
+            # file deliveries, downloads each via /v1/zelda/files/{name}, inserts a REAL
+            # attachment bubble (Telegram-parity: no user message required), then acks.
+            ("GET", "/v1/zelda/push", self._handle_zelda_push_list),
+            ("POST", "/v1/zelda/push/ack", self._handle_zelda_push_ack)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
@@ -2949,6 +2954,82 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             body=body, status=200, content_type=ctype,
             headers={"Content-Disposition": f'attachment; filename="{target.name}"',
                      "Content-Length": str(len(body))})
+
+    # -- ZELDA FORK: native push queue ------------------------------------------------
+    # Files staged in ~/.hermes/zelda-outbound/ plus a JSON job row in
+    # ~/.hermes/zelda-outbound/.push-queue/<id>.json. The fork polls, downloads,
+    # inserts a native attachment bubble, and acks. Job rows are plain JSON files
+    # (no locks needed: writers append unique ids, the fork's ack deletes one row)
+    # and survive gateway restarts — the queue IS the filesystem.
+
+    _ZELDA_PUSH_DIR = Path.home() / ".hermes" / "zelda-outbound" / ".push-queue"
+
+    def _zelda_push_jobs(self) -> List[Dict[str, Any]]:
+        """All pending push jobs, oldest first. Malformed rows are reported in an
+        'errors' side-channel (never silently dropped — a corrupt row must be visible)."""
+        jobs: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        try:
+            rows = sorted(self._ZELDA_PUSH_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        except FileNotFoundError:
+            return []
+        for row in rows:
+            try:
+                data = json.loads(row.read_text())
+                if isinstance(data, dict) and data.get("file"):
+                    data["id"] = row.stem
+                    jobs.append(data)
+                else:
+                    errors.append(f"{row.name}: missing 'file' key")
+            except (json.JSONDecodeError, OSError) as exc:
+                errors.append(f"{row.name}: {exc}")
+        if errors:
+            logger.warning("[zelda-push] malformed queue rows: %s", "; ".join(errors))
+        return jobs
+
+    @staticmethod
+    def _zelda_push_valid_name(name: str) -> bool:
+        return bool(name) and "/" not in name and "\\" not in name and not name.startswith(".")
+
+    @_require_auth
+    async def _handle_zelda_push_list(self, request: "web.Request") -> "web.Response":
+        """GET /v1/zelda/push — pending push jobs for the fork poller. Each job names a
+        file that must still exist in zelda-outbound/ at poll time; vanished files are
+        dropped with a warning (the enqueue script always stages both together, so a
+        missing file means someone removed it mid-queue)."""
+        jobs = []
+        out_dir = Path.home() / ".hermes" / "zelda-outbound"
+        for job in self._zelda_push_jobs():
+            name = str(job.get("file") or "")
+            if not self._zelda_push_valid_name(name):
+                logger.warning("[zelda-push] dropping job %s: invalid file name %r", job.get("id"), name)
+                continue
+            if not (out_dir / name).is_file():
+                logger.warning("[zelda-push] dropping job %s: staged file %s vanished", job.get("id"), name)
+                continue
+            jobs.append({"id": job.get("id"), "file": name,
+                         "topic": job.get("topic") or "", "note": job.get("note") or ""})
+        return web.json_response({"object": "hermes.zelda.push", "jobs": jobs})
+
+    @_require_auth
+    async def _handle_zelda_push_ack(self, request: "web.Request") -> "web.Response":
+        """POST /v1/zelda/push/ack {id} — delete one queue row. 200 either way from the
+        fork's perspective (idempotent); a 404 means another consumer won the race."""
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error_response("Invalid JSON body.", 400, err_type="invalid_request_error")
+        job_id = str((payload or {}).get("id") or "").strip()
+        if not job_id or "/" in job_id or "\\" in job_id or job_id.startswith("."):
+            return _error_response("Invalid job id.", 400, err_type="invalid_request_error")
+        row = self._ZELDA_PUSH_DIR / f"{job_id}.json"
+        try:
+            row.unlink()
+            return web.json_response({"ok": True, "acked": job_id})
+        except FileNotFoundError:
+            return web.json_response({"ok": True, "acked": job_id, "note": "already gone"})
+        except OSError as exc:
+            return _error_response(f"Ack failed: {exc}", 500, err_type="server_error")
 
     @_require_auth
     async def _handle_commands_registry(self, request: "web.Request") -> "web.Response":
