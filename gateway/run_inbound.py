@@ -1506,6 +1506,22 @@ class GatewayInboundMixin:
         message_text, _successful_transcripts = await self._enrich_message_with_transcription(
             message_text, audio_paths,
         )
+        # stt-fallback-gate: if the Whisper fallback was blocked on a missing model download,
+        # tell the user directly (they opted in to being asked before a multi-GB download).
+        try:
+            _gate_pending = os.path.expanduser("~/.hermes/state/stt-fallback-blocked.pending")
+            if os.path.exists(_gate_pending):
+                os.remove(_gate_pending)
+                _gate_adapter = self._delivery_adapter_for(source)
+                if _gate_adapter:
+                    await _gate_adapter.send(
+                        source.chat_id,
+                        "🎙️ STT fallback blocked: Parakeet failed and the Whisper backup "
+                        "model isn't cached (~3GB download). Reply 'allow stt download' "
+                        "and I'll fetch it, or ignore to keep Parakeet-only.",
+                    )
+        except Exception as _gate_exc:
+            logger.debug("stt-fallback-gate notice failed (non-fatal): %s", _gate_exc)
         # Echo each successful transcript back immediately when configured so users can verify STT
         # quality in real time. On transcription failure do NOT send a hardcoded notice: that
         # bypassed the LLM and produced two replies; enrichment leaves one neutral marker instead.
@@ -2025,6 +2041,15 @@ class GatewayInboundMixin:
                 result = fallback
         if not result["success"]:
             logger.info("Voice transcription failed for %s: %s", path, result.get("error", "unknown error"))
+            # stt-fallback-gate: flag a blocked Whisper fallback download so the caller can notify the user
+            if "download blocked" in str(result.get("error", "")):
+                try:
+                    _gate_state = os.path.expanduser("~/.hermes/state/stt-fallback-blocked.pending")
+                    os.makedirs(os.path.dirname(_gate_state), exist_ok=True)
+                    with open(_gate_state, "w") as _gf:
+                        _gf.write(path)
+                except OSError:
+                    pass
             return None, self._untranscribed_audio_note(path)
         transcript = result["transcript"]
         # STT may return success=True with an empty/whitespace transcript (silence, cut-off);

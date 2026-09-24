@@ -550,7 +550,17 @@ def _normalize_multimodal_content(content: Any) -> Any:
             text = part.get("text")
             if text is not None and str(text):
                 normalized_parts.append({"type": "text", "text": _cap_text(str(text))})
+        elif part_type == "input_audio":
+            # ZELDA FORK: passed through untouched — the chat-completions route's
+            # _transcribe_input_audio_parts swaps these for transcribed text right
+            # after normalization passthrough (Signal-fork voice notes). Kept out of
+            # _FILE_PART_TYPES so audio-only turns don't 400 at parse time.
+            normalized_parts.append(part)
         elif part_type in _IMAGE_PART_TYPES:
+            # ZELDA FORK: restore the upstream image branch — the fork edits dropped
+            # it, 400'ing every image turn from the Signal fork (and any OpenAI-shape
+            # client). Canonical vision shape via _normalize_image_part (data: or
+            # http(s) URLs; detail passthrough).
             normalized_parts.append(_normalize_image_part(part))
         elif part_type in _FILE_PART_TYPES:
             raise ValueError(
@@ -577,7 +587,10 @@ def _content_has_visible_payload(content: Any) -> bool:
         for part in content:
             if isinstance(part, dict):
                 ptype = str(part.get("type") or "").strip().lower()
-                if ptype in _IMAGE_PART_TYPES or (
+                # ZELDA FORK: staged input_audio parts count as visible payload — the
+                # quoted-text replacement happens later (collect stage), and rejecting
+                # here would 400 every audio-only turn.
+                if ptype in _IMAGE_PART_TYPES or ptype == "input_audio" or (
                         ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip()):
                     return True
     return False
@@ -1727,6 +1740,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
+            ("GET", "/api/commands", self._handle_commands_registry),
+            ("POST", "/api/commands", self._handle_command_dispatch),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
@@ -1752,7 +1767,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
-            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
+            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            # ZELDA FORK: outbound file push (Hermes → Sinda). Read-only static serving of
+            # ~/.hermes/zelda-outbound/ — Hermes writes files there, the fork GETs them.
+            ("GET", "/v1/zelda/files/{name}", self._handle_zelda_file)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
@@ -2906,6 +2924,155 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                      "Content-Disposition": f'attachment; filename="{receipt.filename}"'})
 
     @_require_auth
+    # -- ZELDA FORK: slash commands over HTTP (Signal fork autocomplete + dispatch) --
+
+    @_require_auth
+    async def _handle_zelda_file(self, request: "web.Request") -> "web.Response":
+        """GET /v1/zelda/files/{name} — stream one file from ~/.hermes/zelda-outbound/ to the
+        Sinda fork (Hermes → phone file push). Path-traversal-guarded: the resolved path must
+        stay inside the outbound dir. 404 unknown/missing, 200 file bytes."""
+        name = request.match_info.get("name", "")
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            return _error_response("Invalid file name.", 400, err_type="invalid_request_error")
+        out_dir = Path.home() / ".hermes" / "zelda-outbound"
+        target = (out_dir / name).resolve()
+        try:
+            target.relative_to(out_dir.resolve())
+        except ValueError:
+            return _error_response("Invalid file name.", 400, err_type="invalid_request_error")
+        if not target.is_file():
+            return _error_response("File not found.", 404, err_type="invalid_request_error")
+        import mimetypes
+        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        body = await asyncio.to_thread(target.read_bytes)
+        return web.Response(
+            body=body, status=200, content_type=ctype,
+            headers={"Content-Disposition": f'attachment; filename="{target.name}"',
+                     "Content-Length": str(len(body))})
+
+    @_require_auth
+    async def _handle_commands_registry(self, request: "web.Request") -> "web.Response":
+        """GET /api/commands — the full slash-command registry (name, description, aliases,
+        args_hint) plus installed skills, for fork-side autocomplete."""
+        try:
+            from hermes_cli.commands import COMMAND_REGISTRY
+            from tools.skills_tool import _find_all_skills, _sort_skills
+            commands = []
+            for cd in COMMAND_REGISTRY:
+                if getattr(cd, "cli_only", False):
+                    continue
+                commands.append({
+                    "name": cd.name,
+                    "description": cd.description,
+                    "aliases": list(getattr(cd, "aliases", ()) or ()),
+                    "args_hint": getattr(cd, "args_hint", "") or "",
+                    "category": getattr(cd, "category", "") or "",
+                    "busy_policy": getattr(cd, "busy_policy", "reject"),
+                })
+            try:
+                skills = [
+                    {"name": s.get("name"), "description": (s.get("description") or "")[:120]}
+                    for s in _sort_skills(_find_all_skills(skip_disabled=False, include_editorial=True))
+                ]
+            except Exception:
+                skills = []
+            return web.json_response({"object": "hermes.commands", "commands": commands, "skills": skills})
+        except Exception:
+            logger.exception("GET /api/commands failed")
+            return _error_response("Failed to enumerate commands", 500, err_type="server_error")
+
+    @_require_auth
+    async def _handle_command_dispatch(self, request: "web.Request") -> "web.Response":
+        """POST /api/commands — authenticated slash dispatch into the LIVE gateway runner.
+
+        Body: {"command": "/new", "sessionId": "..."} (sessionId optional context only).
+        The event runs through the same admission + slash-dispatch path as any inbound
+        message, so handler side effects (session reset, restart, model switches) are real.
+        The reply is whatever the command handler returns (string) — an empty string means
+        the handler acked/sent its own output."""
+        try:
+            body = await request.json()
+        except Exception:
+            return _error_response("Invalid JSON", 400, code="invalid_json")
+        command = str((body or {}).get("command") or "").strip()
+        session_id = str((body or {}).get("sessionId") or "").strip()
+        if not command.startswith("/"):
+            return _error_response("command must start with '/'", 400, code="invalid_command")
+        raw_name = command.lstrip().split(maxsplit=1)[0][1:].lower()
+        if not raw_name or "/" in raw_name:
+            return _error_response("Invalid command name", 400, code="invalid_command")
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        if runner is None:
+            from gateway.run import _gateway_runner_ref
+            runner = _gateway_runner_ref()
+        if runner is None:
+            return _error_response("Gateway runner unavailable", 503, err_type="server_error")
+
+        from gateway.platforms.event import MessageEvent, MessageType
+        from gateway.session import Platform, SessionSource
+
+        source = SessionSource(
+            platform=Platform.API_SERVER,
+            chat_id=session_id or "zelda-fork",
+            chat_name="Zelda Signal Fork",
+            chat_type="dm",
+            user_id="zelda-fork",
+            user_name="OJ (Zelda fork)",
+        )
+        event = MessageEvent(
+            text=command,
+            message_type=MessageType.COMMAND,
+            user_id=source.user_id,
+            user_name=source.user_name,
+            source=source,
+            message_id=f"zelda-{int(time.time()*1000)}",
+        )
+        try:
+            handled, result = await self._dispatch_command_event_for_fork(event, source)
+        except Exception:
+            logger.exception("POST /api/commands dispatch failed for %s", command)
+            return _error_response("Command dispatch failed", 500, err_type="server_error")
+        return web.json_response({
+            "object": "hermes.command.result",
+            "command": command,
+            "handled": bool(handled),
+            "result": result if isinstance(result, str) else "",
+        })
+
+    async def _dispatch_command_event_for_fork(self, event: "MessageEvent", source: "SessionSource"):
+        """Route a fork command event through the runner's REAL slash dispatchers.
+
+        Order mirrors _handle_message: running-session busy dispatch first, then the idle
+        command table. Returns (handled, result-text-or-None)."""
+        runner = self.gateway_runner or _gateway_runner_ref_fallback()
+        if runner is None:
+            return (False, None)
+        quick_key = runner._session_key_for_source(source)
+        # Busy path: a live agent for this session key gets the real busy dispatcher.
+        try:
+            if runner._is_session_running(quick_key):
+                from hermes_cli.commands import COMMAND_REGISTRY as _REG
+                by_name = {cd.name: cd for cd in _REG}
+                name = event.get_command()
+                cmd_def = by_name.get(name)
+                if cmd_def is not None:
+                    result = await runner._dispatch_busy_slash_command(event, cmd_def, quick_key, source)
+                    return (True, result if isinstance(result, str) else None)
+        except Exception:
+            logger.exception("fork busy dispatch failed; falling back to idle table")
+        # Idle path: the runner's own idle command table.
+        try:
+            handlers = runner._gateway_idle_command_handlers()
+            name = event.get_command()
+            handler = handlers.get(name)
+            if handler is not None:
+                result = await handler(event)
+                return (True, result if isinstance(result, str) else None)
+        except Exception:
+            logger.exception("fork idle dispatch failed for %s", event.get_command())
+            return (True, "Command failed — see gateway log")
+        return (False, None)
+
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — deterministic JSON listing of installed skills (name, description,
         category), the same set ``/skills list`` shows."""

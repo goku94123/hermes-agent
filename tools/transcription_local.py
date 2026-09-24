@@ -147,6 +147,14 @@ def _create_whisper_model(model_name: str, *, device: str, compute_type: str):
         # snapshot_download still returns it and ctranslate2 raises "Unable to open file".
         if isinstance(exc, RuntimeError) and "Unable to open file" not in str(exc):
             raise
+        # stt-fallback-gate: block auto-download without explicit permission
+        import os as _os
+        _gate = _os.path.expanduser("~/.hermes/state/stt-fallback-download.allowed")
+        if not _os.path.exists(_gate):
+            raise RuntimeError(
+                f"STT fallback model '{model_name}' not cached; "
+                "download blocked (user must allow it first)"
+            )
         logger.info("faster-whisper model '%s' is not cached; downloading it from the Hugging Face Hub", model_name)
 
     # huggingface_hub surfaces every Hub/network failure as an OSError subclass

@@ -1331,6 +1331,54 @@ class GatewaySlashCommandsMixin(
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")
 
+    # ------------------------------------------------------------------ /stoplocal
+    _STOPLOCAL_SCRIPT = Path.home() / ".hermes" / "scripts" / "llama-unstick.sh"
+    _STOPLOCAL_TIMEOUT_S = 300  # reboot = systemd restart + cold model load + 3 verification tests
+
+    async def _handle_stoplocal_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+        """Handle /stoplocal — reboot or unstick the local llama-swap model server.
+
+        ``/stoplocal`` (no arg) = full reboot: restarts the llama-swap systemd unit, cold-loads
+        the primary model, runs 3 verification completions. ``/stoplocal unstick`` kills only the
+        wedged llama-server child(ren) — llama-swap relaunches them on demand. ``/stoplocal
+        status`` is read-only. The long run (cold load ~30-50s + 3 tests) executes in a worker
+        thread; the ack is returned immediately and the verdict is sent as a follow-up message.
+        """
+        arg = (event.get_command_args().strip().lower() or "reboot")
+        if arg not in ("status", "reboot", "unstick"):
+            return (f"Unknown /stoplocal arg `{arg}` — use `status`, `reboot` (default) or `unstick`.")
+        if not self._STOPLOCAL_SCRIPT.exists():
+            return f"✗ Script not found: {self._STOPLOCAL_SCRIPT}"
+
+        def _run() -> str:
+            import subprocess
+            proc = subprocess.run(
+                ["bash", str(self._STOPLOCAL_SCRIPT), arg],
+                capture_output=True, text=True, timeout=self._STOPLOCAL_TIMEOUT_S,
+            )
+            tail = (proc.stdout or proc.stderr or "").strip()
+            return tail[-1200:] if tail else f"no output (exit {proc.returncode})"
+
+        ack = {
+            "reboot": "🔄 /stoplocal reboot — restarting llama-swap + cold-load + 3 verification tests. "
+                      "Back in ~1-2 min.",
+            "unstick": "🔧 /stoplocal unstick — killing wedged llama-server child(ren), relaunch + 3 tests. "
+                       "Back in ~1 min.",
+            "status": None,
+        }[arg]
+        if ack is not None:
+            adapter = self.adapters.get(event.source.platform) if getattr(self, "adapters", None) else None
+            if adapter:
+                try:
+                    await adapter.send(
+                        str(event.source.chat_id), ack,
+                        metadata=self._thread_metadata_for_source(event.source),
+                    )
+                except Exception as e:
+                    logger.warning("stoplocal ack send failed: %s", e)
+            return ""
+        return await self._run_in_executor_with_context(_run)
+
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
