@@ -522,7 +522,152 @@ class _ResponsesStream:
 
 
 class OpenAICompatRoutesMixin:
-    """/v1/chat/completions and /v1/responses handlers + SSE writers."""
+    """``/v1/chat/completions`` and ``/v1/responses`` handlers + SSE writers."""
+
+    # ZELDA FORK: max base64-decoded audio bytes accepted per input_audio part
+    # (8 MB). Voice notes from the fork are short AAC clips; anything larger is
+    # rejected rather than silently transcribing an hour of audio.
+    _MAX_INPUT_AUDIO_BYTES = 8 * 1024 * 1024
+
+    async def _stage_input_audio_parts(self, conversation_messages: List[Dict[str, Any]]) -> tuple:
+        """ZELDA FORK: fast pre-response stage for ``input_audio`` parts — validate shape,
+        base64-decode, cache bytes to disk. NO STT here: streaming callers emit SSE headers
+        first (the Signal fork ACKs at gateway-accept) and transcribe after, so the spinner
+        stops the moment the gateway receives the note, not when STT finishes.
+
+        Staged parts are annotated in place with ``zelda_cache_path``.
+        Returns ``(staged_count, error_response_or_None)``."""
+        self.zelda_last_transcript = None
+        from gateway.platforms.api_server import _error_response
+        has_audio = any(
+            isinstance(m.get("content"), list)
+            and any(isinstance(p, dict) and str(p.get("type") or "").lower() == "input_audio"
+                    for p in m["content"])
+            for m in conversation_messages
+        )
+        if not has_audio:
+            return 0, None
+        import base64
+        import binascii
+        from gateway.platforms.base import cache_audio_from_bytes
+
+        staged = 0
+        for msg in conversation_messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not (isinstance(part, dict) and str(part.get("type") or "").lower() == "input_audio"):
+                    continue
+                payload = part.get("input_audio") or {}
+                if not isinstance(payload, dict):
+                    return staged, _error_response(
+                        "input_audio part must contain an input_audio object with format + data.",
+                        400, code="invalid_content_part")
+                fmt = str(payload.get("format") or "").strip().lower()
+                data = payload.get("data")
+                if fmt not in ("aac", "m4a", "mp4", "ogg", "mp3", "wav") \
+                        or not isinstance(data, str) or not data.strip():
+                    return staged, _error_response(
+                        "input_audio parts require format='aac|m4a|mp4|ogg|mp3|wav' and base64 'data'.",
+                        400, code="unsupported_content_type")
+                try:
+                    audio_bytes = base64.b64decode(data, validate=True)
+                except (binascii.Error, ValueError):
+                    return staged, _error_response(
+                        "input_audio data is not valid base64.", 400, code="invalid_content_part")
+                if not audio_bytes:
+                    return staged, _error_response("input_audio data is empty.", 400, code="invalid_content_part")
+                if len(audio_bytes) > self._MAX_INPUT_AUDIO_BYTES:
+                    return staged, _error_response(
+                        f"input_audio exceeds the {self._MAX_INPUT_AUDIO_BYTES}-byte cap.",
+                        413, code="audio_too_large")
+                try:
+                    path = cache_audio_from_bytes(audio_bytes, ext=".m4a")
+                except ValueError as exc:
+                    return staged, _error_response(str(exc), 413, code="audio_too_large")
+                except Exception:
+                    logger.exception("Failed to cache inbound input_audio payload")
+                    return staged, _error_response("Failed to cache inbound audio.", 500, code="audio_cache_failed")
+                # ZELDA FORK: STT starts NOW in the background — by the time the SSE
+                # writer reaches the collect point the transcription is usually already
+                # done, so the transcript event lands with no extra wait.
+                import asyncio
+                from tools.transcription_tools import transcribe_audio
+                part["zelda_stt_task"] = asyncio.ensure_future(
+                    asyncio.to_thread(transcribe_audio, path, None, "gateway"))
+                part["zelda_cache_path"] = path
+                staged += 1
+        return staged, None
+
+    async def _collect_staged_audio_parts(
+            self, conversation_messages: List[Dict[str, Any]],
+            on_transcript=None):
+        """ZELDA FORK: await the per-part STT tasks spawned by [_stage_input_audio_parts]
+        (or run STT inline for parts staged without one), replacing each staged part with
+        its quoted-text part — the same shape the Telegram voice path feeds the model.
+        ``on_transcript(text)`` fires per successful transcription (the SSE path emits each
+        as a ``zelda.transcript`` event the moment STT lands, before the model runs).
+        Returns an error response or None."""
+        import asyncio
+        from tools.transcription_tools import transcribe_audio_local_fallback
+
+        for msg in conversation_messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            rebuilt: List[Dict[str, Any]] = []
+            for part in content:
+                cache_path = part.get("zelda_cache_path") if isinstance(part, dict) else None
+                if not cache_path:
+                    rebuilt.append(part)
+                    continue
+                stt_task = part.pop("zelda_stt_task", None) if isinstance(part, dict) else None
+                part.pop("zelda_cache_path", None)
+                if stt_task is not None:
+                    try:
+                        result = await stt_task
+                    except Exception:
+                        logger.exception("input_audio STT task failed")
+                        result = {"success": False}
+                else:
+                    from tools.transcription_tools import transcribe_audio
+                    result = await asyncio.to_thread(transcribe_audio, cache_path, None, "gateway")
+                if not result.get("success"):
+                    result = await asyncio.to_thread(transcribe_audio_local_fallback, cache_path)
+                if not result.get("success"):
+                    logger.info("input_audio transcription failed: %s", result.get("error", "unknown"))
+                    rebuilt.append({"type": "text", "text": (
+                        "[The user sent a voice message but it could not be transcribed — "
+                        "speech-to-text returned no words. Do not guess at the content; "
+                        "ask the user to resend or type it out.]")})
+                    continue
+                transcript = str(result.get("transcript") or "").strip()
+                if not transcript:
+                    rebuilt.append({"type": "text", "text": (
+                        "[The user sent a voice message but it came through empty or "
+                        "inaudible — speech-to-text returned no words. Do not guess at "
+                        "the content; ask the user to resend or type it out.]")})
+                    continue
+                if self.zelda_last_transcript is None:
+                    self.zelda_last_transcript = transcript
+                if on_transcript is not None:
+                    on_transcript(transcript)
+                # Same plain quoted-line shape the Telegram voice path uses.
+                rebuilt.append({"type": "text", "text": f'"{transcript}"'})
+            msg["content"] = rebuilt if rebuilt else ""
+        return None
+
+    async def _transcribe_input_audio_parts(self, conversation_messages: List[Dict[str, Any]]):
+        """ZELDA FORK: transcribe OpenAI-style ``input_audio`` content parts (the shape
+        Signal-fork voice notes arrive in) into quoted text using the same STT pipeline
+        the Telegram adapter feeds. Non-streaming convenience wrapper: stage (validate +
+        decode + cache), then transcribe inline — nothing is on the wire yet, so blocking
+        here costs the client nothing. Streaming callers split the two phases instead."""
+        staged, err = await self._stage_input_audio_parts(conversation_messages)
+        if err is not None or staged == 0:
+            return err
+        return await self._collect_staged_audio_parts(conversation_messages)
 
     def _select_request_route(
         self, body: Dict[str, Any], *, session_id, gateway_session_key, model_alias) -> tuple:
@@ -646,6 +791,37 @@ class OpenAICompatRoutesMixin:
                 conversation_messages.append({"role": role, "content": content})
         user_message: Any = (conversation_messages[-1].get("content", "") if conversation_messages else "")
         history = conversation_messages[:-1]
+        # ZELDA FORK: transcribe OpenAI-style input_audio parts (Signal-fork voice
+        # notes) into text before the visible-payload check — an audio-only turn
+        # becomes a text turn and no longer 400s. Runs before the stream branch too,
+        # so SSE turns get the same treatment.
+        # ZELDA FORK: stage OpenAI-style input_audio parts (Signal-fork voice notes) —
+        # validate + decode + cache, and kick off background STT per part. Fast: no STT
+        # on this path, so a streaming turn gets its SSE headers (and the fork its ACK)
+        # the moment the gateway has the bytes on disk. Transcription completes inside
+        # the stream branch (collect) or inline for non-streaming callers.
+        _staged_audio, audio_err = await self._stage_input_audio_parts(conversation_messages)
+        if audio_err is not None:
+            return audio_err
+        user_message = (conversation_messages[-1].get("content", "") if conversation_messages else "")
+        # ZELDA FORK: skill-slash parity — "/skill args" from the Signal fork loads the
+        # skill with the same rewrite the messaging pipeline applies
+        # (run_inbound._hm_skill_slash_rewrite). Plain text turns are untouched.
+        if isinstance(user_message, str) and user_message.lstrip().startswith("/"):
+            try:
+                from agent.skill_commands import resolve_skill_command_key, build_skill_invocation_message
+                _slash_parts = user_message.lstrip().split(maxsplit=1)
+                _cmd_key = resolve_skill_command_key(_slash_parts[0][1:].lower())
+                if _cmd_key is not None:
+                    _rewritten = build_skill_invocation_message(
+                        _cmd_key, _slash_parts[1].strip() if len(_slash_parts) > 1 else "",
+                        task_id=session_id)
+                    if _rewritten:
+                        logger.info("Zelda fork skill-slash rewrite: /%s -> skill invocation", _slash_parts[0][1:])
+                        conversation_messages[-1]["content"] = _rewritten
+                        user_message = _rewritten
+            except Exception:
+                logger.exception("Zelda skill-slash rewrite failed (non-fatal)")
         if not _content_has_visible_payload(user_message):
             return _invalid_request("No user message found in messages")
 
@@ -736,30 +912,68 @@ class OpenAICompatRoutesMixin:
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
+                from agent.display import build_tool_preview, get_tool_emoji
+                label = build_tool_preview(function_name, function_args) or function_name
                 _stream_q.put_threadsafe(("__tool_progress__", {
-                    "tool": function_name, "toolCallId": tool_call_id, "status": "completed"}))
+                    "tool": function_name, "emoji": get_tool_emoji(function_name), "label": label,
+                    "toolCallId": tool_call_id, "status": "completed"}))
 
             # tool_progress_callback deliberately NOT wired: it would duplicate the structured
             # start/complete callbacks (which carry the tool_call id).
-            # The completion id doubles as the run id; on_done drops the approval mapping once the
-            # turn ends (POST /v1/runs/{id}/approval then answers 409) and sets the terminal status.
             approval_notify, end_stream_run = self._register_stream_approval(
                 request, completion_id, _stream_q, session_id)
-            agent_task, agent_ref = self._spawn_stream_agent(
-                _stream_q, on_done=end_stream_run, tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete, approval_notify_callback=approval_notify,
-                approval_session_key=completion_id, **run_kwargs)
+
+            # ZELDA FORK: on a voice-note turn the agent must NOT start until the staged
+            # audio parts are transcribed (collect emits zelda.transcript events before
+            # the model runs). The spawner closure recomputes user_message AFTER collect
+            # replaces each staged part with its quoted text; run_kwargs is finalized
+            # there too. conversation_messages is passed through so collect can pop the
+            # unserializable zelda_stt_task keys and swap in transcripts in-place —
+            # staging put asyncio.Tasks INSIDE these message dicts.
+            _zelda_audio = [
+                p for m in conversation_messages if isinstance(m.get("content"), list)
+                for p in m["content"]
+                if isinstance(p, dict) and p.get("zelda_cache_path")
+            ]
+
+            if _zelda_audio:
+                def _spawn_agent():
+                    _user = (conversation_messages[-1].get("content", "") if conversation_messages else "")
+                    run_kwargs["user_message"] = _user
+                    return self._spawn_stream_agent(
+                        _stream_q, on_done=end_stream_run, tool_start_callback=_on_tool_start,
+                        tool_complete_callback=_on_tool_complete, approval_notify_callback=approval_notify,
+                        approval_session_key=completion_id, **run_kwargs)
+                agent_task = None
+                agent_ref: list = [None]
+            else:
+                def _spawn_agent():
+                    return self._spawn_stream_agent(
+                        _stream_q, on_done=end_stream_run, tool_start_callback=_on_tool_start,
+                        tool_complete_callback=_on_tool_complete, approval_notify_callback=approval_notify,
+                        approval_session_key=completion_id, **run_kwargs)
+                agent_task, agent_ref = _spawn_agent()
             # #13437 identity contract: an explicit-header client keeps addressing the id it
             # sent; the response echoes that stable id while reads/writes adopt the live tip,
-            # so a rotation mid-turn (after these headers are prepared) never changes what the
-            # client should send next — it re-sends the same id and the tip resolution above
-            # finds whatever session is live by then.
+            # so a rotation mid-turn (after these headers are prepared) never changes what
+            # the client should send next — it re-sends the same id and the tip resolution
+            # above finds whatever session is live by then.
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=(provided_session_id or session_id),
-                gateway_session_key=gateway_session_key)
+                gateway_session_key=gateway_session_key,
+                zelda_audio_parts=(_zelda_audio or None),
+                zelda_audio_messages=(conversation_messages if _zelda_audio else None),
+                agent_spawner=_spawn_agent)
 
         async def _compute_completion():
+            # ZELDA FORK: finish staged audio STT inline (nothing is on the wire yet, so
+            # blocking here is free) and refresh user_message before the agent runs —
+            # otherwise the model would see raw staged parts with internal keys.
+            if _staged_audio:
+                await self._collect_staged_audio_parts(conversation_messages)
+                run_kwargs["user_message"] = (
+                    conversation_messages[-1].get("content", "") if conversation_messages else "")
             return await self._run_agent(**run_kwargs)
         outcome, err = await self._run_idempotent(
             request, body, _compute_completion, log_label="chat completions",
@@ -804,6 +1018,11 @@ class OpenAICompatRoutesMixin:
         reasoning_text = _turn_reasoning_text(history, user_message, result)
         if reasoning_text and not presentation_muted:
             response_data["choices"][0]["message"]["reasoning_content"] = reasoning_text
+        # ZELDA FORK: surface the voice-note transcript so the fork can render a
+        # Telegram-style "what was heard" bubble before the reply.
+        zelda_transcript = getattr(self, "zelda_last_transcript", None)
+        if zelda_transcript:
+            response_data["zelda_transcript"] = zelda_transcript
         if is_partial or is_failed or not completed:
             response_data["hermes"] = _hermes_extras(
                 completed, is_partial, is_failed, "" if presentation_muted else err_msg, finish_reason)
@@ -858,10 +1077,21 @@ class OpenAICompatRoutesMixin:
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
-        created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        gateway_session_key: str = None) -> "web.StreamResponse":
+        created: int, stream_q, agent_task, agent_ref, session_id: str = None,
+        gateway_session_key: str = None,
+        zelda_audio_parts: Optional[List[Dict[str, Any]]] = None,
+        zelda_audio_messages: Optional[List[Dict[str, Any]]] = None,
+        agent_spawner=None) -> "web.StreamResponse":
         """Stream ``chat.completion.chunk`` frames from the agent's delta queue. On client
-        disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled."""
+        disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled.
+
+        ZELDA FORK: when ``zelda_audio_parts`` is set (Signal-fork voice-note turn), STT was
+        already spawned by [_stage_input_audio_parts] and the agent is NOT started until the
+        transcripts are collected here — SSE headers are already on the wire at this point,
+        so the fork's spinner stops at gateway-accept and each transcript lands as its own
+        ``zelda.transcript`` event BEFORE the model runs (Telegram transcript ordering).
+        ``agent_spawner()`` must then create the agent post-collect (it recomputes the
+        user message now that staged audio parts are quoted text)."""
         from gateway.platforms.api_server import (
             _abandon_agent_task, _chat_usage_payload, _resolve_media_to_data_urls, _sse_frame)
         response = await self._prepare_sse_response(request, session_id, gateway_session_key)
@@ -871,6 +1101,36 @@ class OpenAICompatRoutesMixin:
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
         content_sent = False
+
+        # ZELDA FORK: collect the staged voice-note STT (tasks already running) and emit
+        # each transcript as its own SSE event BEFORE spawning the agent. An STT failure
+        # surfaces as a turn error on the live stream (finish_reason=error) — the fork
+        # already handles that shape (Retry).
+        if zelda_audio_parts:
+            assert agent_spawner is not None, "zelda_audio_parts requires agent_spawner"
+            def _on_transcript(text: str) -> None:
+                stream_q.put_threadsafe(("__zelda_transcript__", {"transcript": text}))
+            # Collect MUST run on the real conversation_messages: it pops zelda_stt_task
+            # (an asyncio.Task — unserializable, crashed openapi_dumps with "Object of
+            # type Task is not JSON serializable", killing the 2026-09-24 22:52 Sinda
+            # voice+image turn) AND replaces each staged audio part with its quoted
+            # transcript in msg["content"]. Passing the bare parts list (or a wrapper)
+            # either no-ops silently or drops the transcript from the user message.
+            try:
+                collect_err = await self._collect_staged_audio_parts(
+                    zelda_audio_messages if zelda_audio_messages is not None
+                    else [{"content": zelda_audio_parts}],
+                    on_transcript=_on_transcript)
+            except Exception as exc:
+                logger.error("zelda input_audio collect failed: %s", exc, exc_info=True)
+                collect_err = exc
+            if collect_err is not None:
+                # The agent was never spawned — nothing to abandon.
+                await response.write(_sse_frame(_chunk({}, "error")))
+                await response.write(b"data: [DONE]\n\n")
+                return response
+            agent_task, agent_ref = agent_spawner()
+
         try:
             await response.write(_sse_frame(_chunk({"role": "assistant"})))
             async for delta in _iter_stream_items(stream_q, agent_task, response):
@@ -881,6 +1141,10 @@ class OpenAICompatRoutesMixin:
                     if not self._tool_progress_events:
                         continue  # opted out for strict OpenAI clients (#12020)
                     await response.write(_sse_frame(delta[1], event="hermes.tool.progress"))
+                elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__zelda_transcript__":
+                    # ZELDA FORK: voice-note transcript emitted by the collect stage BEFORE
+                    # the model runs — Telegram transcript ordering on the wire.
+                    await response.write(_sse_frame(delta[1], event="zelda.transcript"))
                 elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__reasoning__":
                     # DeepSeek-style ``delta.reasoning_content`` (#99552), the field Open WebUI,
                     # opencode and the Vercel AI SDK render as a thinking block.
@@ -928,11 +1192,19 @@ class OpenAICompatRoutesMixin:
                         "type": type(agent_error).__name__ if agent_error else "agent_error"}
                 finish_chunk["hermes"] = _hermes_extras(
                     completed, is_partial, is_failed, "" if presentation_muted else err_msg, finish_reason)
+            # ZELDA FORK: transcript events are now emitted by the collect stage BEFORE the
+            # model runs (see zelda_audio_parts above); the old end-of-stream emission was a
+            # duplicate and broke Telegram transcript ordering.
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            await _abandon_agent_task(agent_ref, agent_task, "SSE client disconnected")
-            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+            # ZELDA FORK: on a voice-note turn the agent may not have spawned yet
+            # (disconnect during STT) — nothing to interrupt in that case.
+            if agent_task is not None:
+                await _abandon_agent_task(agent_ref, agent_task, "SSE client disconnected")
+                logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+            else:
+                logger.info("SSE client disconnected during transcript collect; task %s", completion_id)
         except Exception:
             # Agent crashed mid-stream: an error chunk beats a TransferEncodingError.
             import traceback as _tb
