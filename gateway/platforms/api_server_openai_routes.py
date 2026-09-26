@@ -928,6 +928,23 @@ class OpenAICompatRoutesMixin:
                         request, session_id=session_id, gateway_session_key=gateway_session_key)
                 return await self._handle_zelda_steer(
                     request, session_id=session_id, gateway_session_key=gateway_session_key)
+        # ZELDA FORK (2026-09-26): generic slash gate — the same shape as the TUI/Desktop
+        # ``slash.exec`` surface. A fork message whose FIRST token resolves in the live
+        # COMMAND_REGISTRY dispatches into the real gateway handler on THIS topic's session
+        # (Task 1's id-addressed machinery); everything else is plain text. Unknown tokens and
+        # cli_only entries fall through to the LLM, so normal typing never breaks and every
+        # future upstream command works after update+restart without fork changes. Dedicated
+        # fork shims (new/reset/steer) keep their faster paths; /branch gets its own handler.
+        if (request.headers.get("X-Zelda-Client", "").strip() == "1" and provided_session_id
+                and isinstance(user_message, str) and user_message.lstrip().startswith("/")):
+            _gate_head = user_message.lstrip().split(maxsplit=1)[0][1:].lower()
+            from hermes_cli.commands import resolve_command as _resolve_cmd
+            _gate_def = _resolve_cmd(_gate_head) if _gate_head else None
+            if (_gate_def is not None and not getattr(_gate_def, "cli_only", False)
+                    and _gate_head not in ("new", "reset", "steer", "branch")):
+                return await self._handle_zelda_command_dispatch(
+                    request, command=user_message.strip(), cmd_def=_gate_def,
+                    session_id=session_id, gateway_session_key=gateway_session_key, stream=stream)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -1580,6 +1597,109 @@ class OpenAICompatRoutesMixin:
             "object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
     # -- ZELDA FORK: /new + /reset parity for the id-addressed Signal fork (Sinda) --------
+
+    async def _handle_zelda_command_dispatch(
+            self, request: "web.Request", *, command: str, cmd_def, session_id: str,
+            gateway_session_key: Optional[str], stream: bool) -> "web.Response":
+        """ZELDA FORK: run one registry slash command for a Sinda client (Task 2 gate).
+
+        Same id-addressed resolution as the Task 1 POST /api/commands fix (adopt the live
+        continuation tip, refuse unknown ids) and the same structured result shape; the
+        OpenAI-compatible body carries the handler output as the assistant bubble plus a
+        ``hermes_command`` metadata block (``slash.exec``-style status). Empty handler output
+        (handlers that ack via push/banner) gets a short fallback ack so the bubble is never
+        blank."""
+        from gateway.platforms.api_server import _error_response
+        from gateway.platforms.api_server_runs import _resolve_live_session_id
+        from gateway.platforms.event import MessageEvent, MessageType
+        from gateway.session import Platform, SessionSource
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return _error_response(
+                "Session addressing requires API key authentication. "
+                "Configure API_SERVER_KEY to enable this feature.", 403)
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return _error_response("Session store unavailable", 503, err_type="server_error")
+        resolved_id = await _resolve_live_session_id(self, session_id)
+        row = await asyncio.to_thread(db.get_session, resolved_id)
+        if row is None:
+            return _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
+
+        stored_origin_json = (row or {}).get("origin_json")
+        source = None
+        if stored_origin_json:
+            try:
+                source = SessionSource.from_dict(json.loads(stored_origin_json))
+            except Exception:
+                logger.exception("zelda gate: unreadable origin_json on %s", resolved_id)
+                source = None
+        if source is None:
+            chat_ref = str((row or {}).get("chat_id") or f"zelda:{resolved_id}")
+            source = SessionSource(
+                platform=Platform.API_SERVER,
+                chat_id=chat_ref,
+                chat_name=str((row or {}).get("display_name") or "Sinda"),
+                chat_type=str((row or {}).get("chat_type") or "dm"),
+                user_id=str((row or {}).get("user_id") or chat_ref),
+                user_name="OJ (Sinda)",
+            )
+        event = MessageEvent(
+            text=command,
+            message_type=MessageType.COMMAND,
+            user_id=source.user_id,
+            user_name=source.user_name,
+            source=source,
+            message_id=f"zelda-{int(time.time()*1000)}",
+        )
+        try:
+            handled, result = await self._dispatch_command_event_for_fork(event, source)
+        except Exception:
+            logger.exception("zelda gate dispatch failed for %s", command)
+            return _error_response("Command dispatch failed", 500, err_type="server_error")
+        result_text = result if isinstance(result, str) else ""
+        if not result_text:
+            result_text = f"✅ `/{cmd_def.name}` executed." if handled else f"❔ `/{cmd_def.name}` not available on this gateway."
+        status = "ok" if handled else "unhandled"
+        meta = {"object": "hermes.command.result", "command": command,
+                "handled": bool(handled), "status": status, "result": result_text,
+                "sessionId": resolved_id}
+
+        if stream:
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            created = int(time.time())
+            model_name = self._model_name
+
+            def _chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
+                return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+
+            response = await self._prepare_sse_response(request, resolved_id, gateway_session_key)
+            try:
+                await response.write(_sse_frame(_chunk({"role": "assistant"})))
+                await response.write(_sse_frame(_chunk({"content": result_text})))
+                await response.write(_sse_frame(_chunk({}, "stop", usage={
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    **{"hermes_command": meta})))
+                await response.write(b"data: [DONE]\n\n")
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                logger.info("zelda gate: SSE client disconnected mid-command (%s)", command)
+            logger.info("Zelda fork gate: %s on %s (stream)", command, resolved_id)
+            return response
+
+        logger.info("Zelda fork gate: %s on %s", command, resolved_id)
+        return web.json_response({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion",
+            "created": int(time.time()), "model": self._model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": result_text},
+                         "finish_reason": "stop"}],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "hermes_command": meta,
+        })
 
     async def _handle_zelda_session_reset(
         self, request: "web.Request", *, command: str, title: str, old_session_id: str,
