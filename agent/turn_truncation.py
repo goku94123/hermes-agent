@@ -359,6 +359,28 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
             f"{partial_response}\n\n{notice}" if partial_response else notice,
             f"Prompt used {filled[0]} of {filled[1]} context tokens; no room to answer",
         )
+    # Divergence kill (#zelda-20260925): the background-review fork shares the parent's context,
+    # so every length-continuation restart re-sends the WHOLE grown conversation while the model
+    # keeps truncating — input ballooned 56K→74K across 4 attempts on a live deployment, bleeding
+    # tokens and tripping the fork's aggregate input budget mid-investigation. Each fragment must
+    # be SMALLER than the last (it is a continuation, not a fresh start); a growing one means the
+    # model cannot fit its output in the completion budget and continuing only multiplies the loss.
+    # partial_response is already appended + _session_messages set by the trail-drop above.
+    if (
+        st.truncated_response_parts
+        and len(st.truncated_response_parts) >= 2
+        and len(str(st.truncated_response_parts[-1])) > len(str(st.truncated_response_parts[-2]))
+    ):
+        agent._vprint(
+            f"{agent.log_prefix}⚠️  Continuation fragment GREW ({len(str(st.truncated_response_parts[-1]))} > "
+            f"{len(str(st.truncated_response_parts[-2]))} chars) — the model cannot fit its output; "
+            "stopping instead of looping continuations.",
+            force=True, diagnostic=True,
+        )
+        return st.end_turn(
+            partial_response or _CEILING_NO_TEXT,
+            "Truncated continuation diverged — kept the partial response (no further attempts)",
+        )
     return st.end_turn(
         partial_response or _CEILING_NO_TEXT,
         "Response remained truncated after 4 continuation attempts",

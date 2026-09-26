@@ -2976,7 +2976,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         for row in rows:
             try:
                 data = json.loads(row.read_text())
-                if isinstance(data, dict) and data.get("file"):
+                if isinstance(data, dict) and (data.get("file") or data.get("text")):
+                    # NOTICE rows carry `text` and no `file`; the list handler
+                    # fans them out. Only rows with NEITHER key are malformed.
                     data["id"] = row.stem
                     jobs.append(data)
                 else:
@@ -2996,10 +2998,37 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """GET /v1/zelda/push — pending push jobs for the fork poller. Each job names a
         file that must still exist in zelda-outbound/ at poll time; vanished files are
         dropped with a warning (the enqueue script always stages both together, so a
-        missing file means someone removed it mid-queue)."""
+        missing file means someone removed it mid-queue). Rows with a `text` key and no
+        `file` are NOTICE rows (Zelda lifecycle notices, 2026-09-25): delivered as-is,
+        no file check."""
         jobs = []
         out_dir = Path.home() / ".hermes" / "zelda-outbound"
         for job in self._zelda_push_jobs():
+            text = str(job.get("text") or "")
+            if not text and not job.get("file"):
+                logger.warning("[zelda-push] dropping job %s: neither text nor file", job.get("id"))
+                continue
+            if text and not job.get("file"):
+                # NOTICE row: fan out per topic session id when `sessions` names them,
+                # otherwise deliver to the phone's default topic mapping (fork-side).
+                sessions = job.get("sessions") or []
+                if isinstance(sessions, list) and sessions:
+                    for sid in sessions:
+                        if isinstance(sid, str) and sid.strip():
+                            jobs.append({
+                                "id": f"{job.get('id')}::{sid.strip()}",
+                                "file": "", "text": text,
+                                "notice": job.get("notice") or "",
+                                "session_id": sid.strip(),
+                                "topic": "", "note": "",
+                            })
+                else:
+                    jobs.append({
+                        "id": str(job.get("id")), "file": "", "text": text,
+                        "notice": job.get("notice") or "", "session_id": "",
+                        "topic": "", "note": "",
+                    })
+                continue
             name = str(job.get("file") or "")
             if not self._zelda_push_valid_name(name):
                 logger.warning("[zelda-push] dropping job %s: invalid file name %r", job.get("id"), name)
@@ -4685,6 +4714,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
+            # ZELDA (2026-09-25): queue the "gateway is back online" notice for the
+            # Sinda fork at api-server startup. The shutdown notice (queued by
+            # run_shutdown into the same filesystem push queue) survives the restart
+            # and is delivered by the fork's first poll after this, so the user sees
+            # the interruption AND the recovery — Telegram-parity lifecycle notices.
+            try:
+                from gateway.zelda_notices import STARTUP_TEXT, queue_zelda_notice
+
+                queue_zelda_notice("startup", STARTUP_TEXT)
+            except Exception:  # noqa: BLE001 — a notice must never block startup
+                logger.debug("[zelda-notices] startup notice queue failed", exc_info=True)
             self._track_background_task(asyncio.create_task(self._sweep_orphaned_runs()))
             # Network-accessible + unsandboxed local terminal backend = host-user RCE surface;
             # warn, don't refuse (the operator may have a firewall / strong key).

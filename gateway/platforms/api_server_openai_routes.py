@@ -791,6 +791,29 @@ class OpenAICompatRoutesMixin:
                 conversation_messages.append({"role": role, "content": content})
         user_message: Any = (conversation_messages[-1].get("content", "") if conversation_messages else "")
         history = conversation_messages[:-1]
+        # ZELDA FORK: surface-context injection — the fork identifies itself with
+        # ``X-Zelda-Client: 1`` on every /v1/chat/completions turn. Without this the
+        # model has no idea which surface it is serving (this route builds NO
+        # "Current Session Context" block), so file-delivery requests default to the
+        # Telegram home channel from the core prompt. Tell it explicitly: replies and
+        # files belong to Sinda; never push a zeldafile:// marker into a Telegram chat.
+        if request.headers.get("X-Zelda-Client", "").strip() == "1":
+            _zelda_note = (
+                "## Current Session Context\n\n"
+                "**Source:** zelda (Sinda — the Zelda Signal fork on OJ's phone, "
+                "served via the API server). **This is NOT Telegram.**\n\n"
+                "**Delivery rules for this turn:**\n"
+                "- This reply is delivered to Sinda. Do not send files or copies to Telegram.\n"
+                "- To give OJ a file: stage it with "
+                "`~/.hermes/scripts/zelda-push.sh <file> ['topic title'] ['note']` and just "
+                "tell him it is pushed — the Sinda app polls /v1/zelda/push and downloads "
+                "it natively. Do NOT append a `zeldafile://` marker; that legacy path is "
+                "retired.\n"
+                "- Do not mention Telegram and do not write anything 'to Telegram' unless "
+                "OJ explicitly asks for a Telegram copy."
+            )
+            system_prompt = _zelda_note if system_prompt is None else system_prompt + "\n\n" + _zelda_note
+            logger.info("Zelda fork turn: X-Zelda-Client context injected")
         # ZELDA FORK: transcribe OpenAI-style input_audio parts (Signal-fork voice
         # notes) into text before the visible-payload check — an audio-only turn
         # becomes a text turn and no longer 400s. Runs before the stream branch too,
@@ -868,6 +891,43 @@ class OpenAICompatRoutesMixin:
             first_user = next(
                 (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
             session_id = _derive_chat_session_id(system_prompt, first_user)
+        # ZELDA FORK: /new + /reset parity — a Sinda client (X-Zelda-Client: 1) addressing a
+        # pinned session id gets a REAL reset here instead of the text reaching the LLM. The
+        # fork's topics are id-addressed (X-Hermes-Session-Id), so POST /api/commands resets a
+        # phantom session-key they never use; this path rotates the session the fork actually
+        # talks to, and the fork rebinds from the response header (same rebind every turn runs).
+        if (request.headers.get("X-Zelda-Client", "").strip() == "1" and provided_session_id
+                and isinstance(user_message, str)):
+            _reset_head = user_message.strip().lower().split(maxsplit=1)[0]
+            if _reset_head in ("/new", "/reset"):
+                _reset_parts = user_message.strip().split(maxsplit=1)
+                return await self._handle_zelda_session_reset(
+                    request, command=_reset_head,
+                    title=(_reset_parts[1].strip() if len(_reset_parts) > 1 else ""),
+                    old_session_id=session_id, gateway_session_key=gateway_session_key,
+                    stream=stream)
+        # ZELDA FORK: /steer parity - steer the LIVE run on THIS topic's session id
+        # (POST /api/commands steers a phantom session-key the id-addressed fork never
+        # uses). Only a plain-text first part qualifies: agent.steer() is text-only, so
+        # a media+/steer send is rejected explicitly instead of losing the image.
+        if (request.headers.get("X-Zelda-Client", "").strip() == "1" and provided_session_id
+                and isinstance(user_message, str)):
+            _steer_head = user_message.strip().lower().split(maxsplit=1)[0]
+            if _steer_head == "/steer":
+                _steer_arg = user_message.strip().split(maxsplit=1)[1].strip() if len(user_message.strip().split(maxsplit=1)) > 1 else ""
+                _user_parts = conversation_messages[-1].get("content") if conversation_messages else None
+                _has_media = isinstance(_user_parts, list) and any(
+                    isinstance(p, dict) and p.get("type") in ("image_url", "input_image", "input_audio")
+                    for p in _user_parts if isinstance(p, dict))
+                if _has_media:
+                    return _invalid_request(
+                        "/steer is text-only - media can't be steered into a running turn. "
+                        "Send the image without /steer, or wait for the current reply to finish.")
+                if not _steer_arg:
+                    return await self._handle_zelda_steer(
+                        request, session_id=session_id, gateway_session_key=gateway_session_key)
+                return await self._handle_zelda_steer(
+                    request, session_id=session_id, gateway_session_key=gateway_session_key)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -1452,6 +1512,253 @@ class OpenAICompatRoutesMixin:
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
         return web.json_response(response_data, headers=response_headers)
+
+    # -- ZELDA FORK: /steer parity for the id-addressed Signal fork (Sinda) --------------
+
+    async def _handle_zelda_steer(self, request: "web.Request", *, session_id: str,
+                                  gateway_session_key: Optional[str]) -> "web.Response":
+        """Sinda /steer: inject guidance into the LIVE run on this topic's session.
+
+        POST /api/commands steers the gateway session-KEY lane, which an id-addressed
+        fork session never has - a phantom-key no-op, the same bug class the /new
+        handler fixed. This resolves the provided id to its live continuation tip,
+        finds the run whose status.session_id matches, and calls agent.steer().
+
+        agent.steer() is text-only (media cannot ride it - it has no image parts),
+        so a media+/steer send is rejected with an explicit message instead of
+        silently losing the image. Idle (no live run): 409 - the fork shows the
+        send as failed and retries as a normal turn, matching /steer-on-idle.
+        """
+        from gateway.platforms.api_server import _error_response
+        from gateway.platforms.api_server_runs import _resolve_live_session_id
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return _error_response("Invalid JSON", 400)
+
+        steer_text = str(body.get("input") or body.get("message") or body.get("text") or "").strip()
+        if not steer_text:
+            return _error_response(
+                "Missing non-empty steer text; expected 'input', 'message', or 'text'.",
+                400, code="invalid_steer_input")
+
+        # Resolve the provided id to its live continuation tip (compression rotation) -
+        # the canonical resolution every client-addressed path applies.
+        resolved = await _resolve_live_session_id(self, session_id)
+
+        live_runs = [
+            (rid, status) for rid, status in self._run_statuses.items()
+            if status.get("session_id") == resolved and status.get("status") == "running"
+        ]
+        if not live_runs:
+            return _error_response(
+                f"No running turn on session {resolved} to steer.",
+                409, code="no_running_turn")
+
+        # Newest live run wins (there should only be one per session).
+        run_id, status = max(live_runs, key=lambda kv: kv[1].get("updated_at", 0) if isinstance(kv[1].get("updated_at"), (int, float)) else 0)
+        agent = self._active_run_agents.get(run_id)
+        if agent is None or not hasattr(agent, "steer"):
+            return _error_response(
+                f"Run {run_id} has no steerable agent.",
+                409, code="run_not_accepting_steer")
+        try:
+            accepted = bool(agent.steer(steer_text))
+        except Exception as exc:
+            logger.exception("[zelda] steer failed for run %s", run_id)
+            return _error_response(f"Steer failed: {exc}", 500, code="steer_failed")
+        if not accepted:
+            return _error_response(
+                f"Run {run_id} did not accept steer text.",
+                409, code="steer_not_accepted")
+        logger.info("Zelda fork /steer: session %s -> run %s accepted", resolved, run_id)
+        return web.json_response({
+            "object": "hermes.run.steer", "run_id": run_id, "accepted": True})
+
+    # -- ZELDA FORK: /new + /reset parity for the id-addressed Signal fork (Sinda) --------
+
+    async def _handle_zelda_session_reset(
+        self, request: "web.Request", *, command: str, title: str, old_session_id: str,
+        gateway_session_key: Optional[str], stream: bool) -> "web.Response":
+        """Real /new + /reset for a Sinda client (X-Zelda-Client: 1) that addresses its
+        session by ``X-Hermes-Session-Id``.
+
+        Mirrors the native reset (gateway/slash_commands_session.py) at the DB level:
+        rotate the session id, insert the successor row with ``parent_session_id`` +
+        ``_reset_from`` so lineage/ownership backfill from the parent, promote the
+        predecessor row to an explicit ``session_reset`` boundary, and stamp the routing
+        peer columns so the fresh session shows the right surface in /resume + desktop UI.
+        A ``/new <title>`` arg sets the new session's title, same as Telegram. No LLM is
+        called; the reply is the reset banner and the fresh id — the fork rebinds its topic
+        from the response header exactly like every normal turn.
+
+        Sinda sessions have NO session-key routing entry (bare ``api_server`` rows), so the
+        POST /api/commands path resets a phantom key the fork never uses; this handler is
+        the only place the id-addressed reset can happen. The provided id may be a
+        pre-rotation parent: adopt the live continuation tip first (same resolution every
+        client-addressed turn applies).
+        """
+        from gateway.platforms.api_server import _error_response, _sse_frame
+        from gateway.session import Platform, SessionSource, _new_session_id, _now
+        from gateway.session_identity import transport_profile_of
+
+        # A reset mutates state: re-check auth here so only an authenticated caller can
+        # reach the rotation, regardless of future call sites.
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not old_session_id:
+            return _error_response("Zelda /reset requires a session id", 400, code="invalid_request")
+
+        # Resolve the provided id to its live continuation tip (compression rotation) —
+        # the canonical resolution the normal turn path applies to client-addressed ids.
+        from gateway.platforms.api_server_runs import _resolve_live_session_id
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return _error_response("Session store unavailable", 503, err_type="server_error")
+        old_session_id = await _resolve_live_session_id(self, old_session_id)
+        old_row = await asyncio.to_thread(db.get_session, old_session_id)
+
+        # Build a synthetic source for row/peer bookkeeping. Prefer the stored origin of
+        # the session being reset (origin_json carries the real surface identity); fall
+        # back to the api_server surface the fork actually talks through.
+        source = None
+        old_origin_json = (old_row or {}).get("origin_json")
+        if old_origin_json:
+            try:
+                import json as _json
+                source = SessionSource.from_dict(_json.loads(old_origin_json))
+            except Exception:
+                logger.exception("zelda reset: unreadable origin_json on %s", old_session_id)
+                source = None
+        if source is None:
+            source = SessionSource(
+                platform=Platform.API_SERVER,
+                chat_id=f"zelda:{old_session_id}",
+                chat_name="Sinda",
+                chat_type="dm",
+                user_id=f"zelda:{old_session_id}",
+                user_name="OJ (Sinda)",
+            )
+
+        # 1) Rotate: fresh id + successor row with lineage backfilled from the parent.
+        # The provided id may not exist (fresh client, first-ever /new, or a typo'd id):
+        # parent_session_id is FK-enforced, so lineage fields are only set when the
+        # parent row is real — an unknown parent starts a fresh root session (the
+        # header_default-vs-header_new banner below already anticipates this).
+        new_session_id = _new_session_id(_now())
+        await asyncio.to_thread(
+            db.create_session,
+            new_session_id,
+            "api_server",
+            user_id=source.user_id,
+            session_key=None,
+            chat_id=source.chat_id,
+            chat_type=source.chat_type,
+            thread_id=source.thread_id,
+            **({"parent_session_id": old_session_id} if old_row else {}),
+            model_config=({"_reset_from": old_session_id} if old_row else None),
+            profile_name=(old_row or {}).get("profile_name"),
+            transport_profile=(old_row or {}).get("transport_profile") or transport_profile_of(source),
+            display_name="Sinda",
+        )
+        # 2) End the predecessor as an explicit reset boundary (advances the conversation
+        #    generation; stale-route recovery cannot resurrect it (#61220)).
+        await asyncio.to_thread(
+            db.promote_to_session_reset, old_session_id, "session_reset")
+        # No session-key routing entry exists for id-addressed fork sessions, so there is no
+        # runner cache to evict and no routing peer to record — the successor row above
+        # already carries the identity columns (same lazy-writer contract as every turn).
+
+        # 4) Banner: same shape Telegram shows after /new; `/new <title>` titles it.
+        from agent.i18n import t
+        from hermes_state import SessionDB
+        header = t("gateway.reset.header_default") if old_row else t("gateway.reset.header_new")
+        # Session-info block identical to Telegram's /new banner (Model/Provider/Context/
+        # Endpoint) — resolved through the runner's profile-scoped helper so the Sinda
+        # surface reports the same model + context the gateway would serve it.
+        session_info = ""
+        try:
+            runner = getattr(self, "gateway_runner", None) or request.app.get("gateway_runner")
+            if runner is None:
+                from gateway.run import _gateway_runner_ref
+                runner = _gateway_runner_ref()
+            if runner is not None and hasattr(runner, "_reset_notice_session_info"):
+                session_info = await asyncio.to_thread(
+                    runner._reset_notice_session_info, source)
+        except Exception:
+            logger.debug("zelda reset: session-info block unavailable", exc_info=True)
+        note = ""
+        if title:
+            try:
+                sanitized = SessionDB.sanitize_title(title)
+            except ValueError as e:
+                sanitized = None
+                note = t("gateway.reset.title_rejected", error=str(e))
+            if sanitized:
+                titled_ok = False
+                try:
+                    titled_ok = bool(await asyncio.to_thread(
+                        db.set_session_title, new_session_id, sanitized))
+                except Exception:
+                    logger.exception("zelda reset: set_session_title failed for %s", new_session_id)
+                if titled_ok:
+                    header = t("gateway.reset.header_titled", title=sanitized)
+                else:
+                    note = t("gateway.reset.title_error_untitled", error="Title could not be saved")
+        try:
+            from hermes_cli.tips import get_random_tip
+            _tip_line = "\n\n" + t("gateway.reset.tip", tip=get_random_tip())
+        except Exception:
+            _tip_line = ""
+        _parts = [header]
+        if session_info:
+            _parts.append(session_info)
+        if note:
+            _parts.append(note)
+        body_text = "\n\n".join(_parts) + _tip_line
+
+        # No session key: nothing to evict in the runner's cache; the (keyless) session
+        # rotation is fully persisted above.
+
+        if stream:
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            created = int(time.time())
+            model_name = self._model_name
+
+            def _chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
+                return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+
+            response = await self._prepare_sse_response(request, new_session_id, gateway_session_key)
+            try:
+                await response.write(_sse_frame(_chunk({"role": "assistant"})))
+                await response.write(_sse_frame(_chunk({"content": body_text})))
+                await response.write(_sse_frame(_chunk({}, "stop", usage={
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0})))
+                await response.write(b"data: [DONE]\n\n")
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                logger.info("zelda /reset: SSE client disconnected after rotation (%s -> %s)",
+                            old_session_id, new_session_id)
+            logger.info("Zelda fork /%s: session %s -> %s (stream)", command, old_session_id, new_session_id)
+            return response
+
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        response_data = {
+            "id": completion_id, "object": "chat.completion", "created": int(time.time()),
+            "model": self._model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": body_text},
+                         "finish_reason": "stop"}],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+        logger.info("Zelda fork /%s: session %s -> %s", command, old_session_id, new_session_id)
+        return web.json_response(response_data, headers={
+            "X-Hermes-Session-Id": new_session_id,
+            **({"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {})})
 
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} — retrieve a stored response."""

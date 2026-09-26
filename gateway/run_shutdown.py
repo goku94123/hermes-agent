@@ -1827,6 +1827,26 @@ class GatewayShutdownMixin:
         await self._cancel_secondary_profile_reconnect_tasks()
         # Notify all chats with active agents BEFORE draining — adapters are still connected here.
         await self._notify_active_sessions_of_shutdown()
+        # ZELDA (2026-09-25): queue the shutdown/restart notice for the Sinda fork —
+        # api_server's send() is a stub, so the platform broadcast above can never reach
+        # it. The push-queue row is a plain file and SURVIVES the restart; the fork
+        # delivers it on its first poll after the gateway (and the queue route) is back.
+        try:
+            from gateway.zelda_notices import RESTART_TEXT, SHUTDOWN_TEXT, queue_zelda_notice
+
+            # Broadcast (empty `sessions`): the fork fans out to its default topic mapping
+            # fork-side. Sinda sessions are id-addressed with no session-key routing entry,
+            # so they never appear in _snapshot_running_agents() — and the keys that DO
+            # appear are other platforms' (e.g. telegram:440947314), whose rsplit'd "ids"
+            # match no Sinda topic. Targeting them here was dead targeting (2026-09-26).
+            _snap = getattr(self, "_snapshot_running_agents", None)
+            if callable(_snap) and _snap():
+                queue_zelda_notice(
+                    "shutdown",
+                    RESTART_TEXT if self._restart_requested else SHUTDOWN_TEXT,
+                )
+        except Exception as e:  # noqa: BLE001 — a notice must never block shutdown
+            logger.debug("zelda shutdown notice unavailable: %s", e)
         logger.info("Shutdown phase: notify_active_sessions done at +%.2fs", ctx.elapsed())
 
     async def _stop_drain_active_work(self, timeout: float, ctx: "GatewayShutdownMixin._StopContext") -> None:

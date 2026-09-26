@@ -1281,7 +1281,21 @@ def _run_review_in_thread(
         logger.warning("Background memory/skill review failed: %s", e)
         if st.review_usage:
             _log_review_completion(st.review_usage, "error")
-        agent._emit_auxiliary_failure("background review", e)
+        # ZELDA FIX (#zelda-20260925): route the fork's failure through the PARENT-SAFE sink.
+        # The parent's _emit_auxiliary_failure ends in its status rail — for a gateway turn that
+        # is the LIVE CHAT STREAM — so a background review's internal failure was surfacing in
+        # OJ's Sinda chat as "⚠️ Hermes unreachable: Response remained truncated…". Same
+        # suppression contract as the gateway's auto-title sink: log with detail, stay off the
+        # wire. Gateway turns always carry _notification_platform (set in
+        # run_turn_runner._wire_turn_agent_callbacks) — detect the gateway that way; CLI keeps
+        # the compact warning.
+        if getattr(agent, "_notification_platform", "") not in ("", "cli", None):
+            logger.warning(
+                "Background review failed (suppressed from chat): %s: %s",
+                e.__class__.__name__, e,
+            )
+        else:
+            agent._emit_auxiliary_failure("background review", e)
     finally:
         # Safety net for the exception path (setup failures before the request-phase finally).
         # Both cleanups are identity-scoped and idempotent; re-enter thread-scoped silence so
