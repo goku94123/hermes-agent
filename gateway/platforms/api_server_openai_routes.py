@@ -941,7 +941,11 @@ class OpenAICompatRoutesMixin:
             from hermes_cli.commands import resolve_command as _resolve_cmd
             _gate_def = _resolve_cmd(_gate_head) if _gate_head else None
             if (_gate_def is not None and not getattr(_gate_def, "cli_only", False)
-                    and _gate_head not in ("new", "reset", "steer", "branch")):
+                    and _gate_head not in ("new", "reset", "steer")):
+                if _gate_head == "branch":
+                    return await self._handle_zelda_branch(
+                        request, command=user_message.strip(),
+                        session_id=session_id, gateway_session_key=gateway_session_key, stream=stream)
                 return await self._handle_zelda_command_dispatch(
                     request, command=user_message.strip(), cmd_def=_gate_def,
                     session_id=session_id, gateway_session_key=gateway_session_key, stream=stream)
@@ -1700,6 +1704,133 @@ class OpenAICompatRoutesMixin:
             "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             "hermes_command": meta,
         })
+
+    async def _handle_zelda_branch(
+            self, request: "web.Request", *, command: str, session_id: str,
+            gateway_session_key: Optional[str], stream: bool) -> "web.Response":
+        """ZELDA FORK: /branch for Sinda (Task 3) — clone the id-addressed session at the DB
+        level, mirroring the upstream branch handler (slash_commands_session.py:992) minus
+        thread creation: Sinda has no platform threads (in-app topics ARE the threads), so a
+        plain ``/branch`` returns the CLONE's id via the response ``X-Hermes-Session-Id``
+        header and the fork creates a new topic bound to it (the same rebind flow as /new).
+        ``--here`` keeps the legacy in-place switch: the topic rebinds onto the clone and the
+        old row ends as an explicit session_switch boundary.
+        """
+        from agent.i18n import t
+        from gateway.platforms.api_server import _error_response, _sse_frame
+        from gateway.platforms.api_server_runs import _resolve_live_session_id
+        from gateway.session import _new_session_id, _now
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return _error_response(
+                "Session addressing requires API key authentication. "
+                "Configure API_SERVER_KEY to enable this feature.", 403)
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return _error_response("Session store unavailable", 503, err_type="server_error")
+
+        from gateway.slash_commands_branch_thread import parse_branch_args
+        stay_here, branch_title = parse_branch_args(command[len("/branch"):].strip())
+
+        resolved_id = await _resolve_live_session_id(self, session_id)
+        row = await asyncio.to_thread(db.get_session, resolved_id)
+        if row is None:
+            return _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
+        history = await asyncio.to_thread(db.get_messages_as_conversation, resolved_id)
+        if not history:
+            return _error_response(
+                "Nothing to branch — this session has no conversation yet.", 400,
+                code="branch_empty_conversation")
+        parent_session_id = resolved_id
+
+        # Title: explicit arg, else lineage numbering from the parent's title (upstream rule).
+        if not branch_title:
+            parent_title = await asyncio.to_thread(db.get_session_title, parent_session_id)
+            branch_title = await asyncio.to_thread(
+                db.get_next_title_in_lineage, parent_title or "branch")
+
+        new_session_id = _new_session_id(_now())
+        # Identity: the clone keeps the parent's peer tuple (Sinda routes by session id, not
+        # by peer) so /resume + the desktop UI show it on the same surface. The fork routes
+        # the new topic by the id alone; session_key stays NULL like every Sinda row.
+        await asyncio.to_thread(
+            db.create_session,
+            new_session_id,
+            "api_server",
+            user_id=(row or {}).get("user_id"),
+            session_key=None,
+            chat_id=(row or {}).get("chat_id"),
+            chat_type=(row or {}).get("chat_type") or "dm",
+            thread_id=(row or {}).get("thread_id"),
+            **({"parent_session_id": parent_session_id} if row else {}),
+            model_config={"_branched_from": parent_session_id},
+            profile_name=(row or {}).get("profile_name"),
+            transport_profile=(row or {}).get("transport_profile"),
+            display_name=(row or {}).get("display_name") or "Sinda",
+        )
+        # Copy the conversation in bounded-chunk transactions (same as upstream; a failed
+        # copy still yields a usable partial branch).
+        from gateway.slash_commands_session import _branch_row
+        import contextlib as _contextlib
+        with _contextlib.suppress(Exception):
+            await asyncio.to_thread(
+                db.append_messages_batch, new_session_id,
+                [_branch_row(msg) for msg in history], chunk_rows=500)
+        with _contextlib.suppress(Exception):
+            await asyncio.to_thread(db.set_session_title, new_session_id, branch_title)
+
+        msg_count = len([m for m in history if m.get("role") == "user"])
+        if stay_here:
+            # In-place switch: end the parent row as an explicit boundary (same reason string
+            # the native switch path promotes) so stale-route recovery cannot resurrect it.
+            with _contextlib.suppress(Exception):
+                await asyncio.to_thread(db.promote_to_session_reset, parent_session_id, "session_switch")
+            logger.info("Zelda fork /branch --here: session %s -> %s", parent_session_id, new_session_id)
+        else:
+            logger.info("Zelda fork /branch: session %s -> clone %s (topic rebind via header)",
+                        parent_session_id, new_session_id)
+        reply = t("gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many",
+                  title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
+        if stay_here:
+            reply += "\n" + "This conversation switched onto the branch; use `/resume` to go back."
+        meta = {"object": "hermes.command.result", "command": command, "handled": True,
+                "status": "ok", "result": reply, "sessionId": new_session_id,
+                "branchedFrom": parent_session_id, "branchedTo": new_session_id}
+
+        if stream:
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            created = int(time.time())
+            model_name = self._model_name
+
+            def _chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
+                return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+
+            response = await self._prepare_sse_response(request, new_session_id, gateway_session_key)
+            try:
+                await response.write(_sse_frame(_chunk({"role": "assistant"})))
+                await response.write(_sse_frame(_chunk({"content": reply})))
+                await response.write(_sse_frame(_chunk({}, "stop", usage={
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    **{"hermes_command": meta})))
+                await response.write(b"data: [DONE]\n\n")
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                logger.info("zelda /branch: SSE client disconnected after clone (%s -> %s)",
+                            parent_session_id, new_session_id)
+            return response
+
+        return web.json_response({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion",
+            "created": int(time.time()), "model": self._model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": reply},
+                         "finish_reason": "stop"}],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "hermes_command": meta,
+        }, headers={"X-Hermes-Session-Id": new_session_id})
 
     async def _handle_zelda_session_reset(
         self, request: "web.Request", *, command: str, title: str, old_session_id: str,
