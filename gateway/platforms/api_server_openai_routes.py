@@ -1642,25 +1642,12 @@ class OpenAICompatRoutesMixin:
         row = await asyncio.to_thread(db.get_session, resolved_id)
         if row is None:
             return _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
-
-        stored_origin_json = (row or {}).get("origin_json")
-        source = None
-        if stored_origin_json:
-            try:
-                source = SessionSource.from_dict(json.loads(stored_origin_json))
-            except Exception:
-                logger.exception("zelda gate: unreadable origin_json on %s", resolved_id)
-                source = None
+        # ZELDA FORK siblingfix: per-session peer identity + keyed bind via the adapter helper
+        # (see APIServerAdapter._bind_zelda_session_identity for the why — the peer fallback
+        # recovered the LATEST sibling, not the addressed row).
+        source = await self._bind_zelda_session_identity(resolved_id, row)
         if source is None:
-            chat_ref = str((row or {}).get("chat_id") or f"zelda:{resolved_id}")
-            source = SessionSource(
-                platform=Platform.API_SERVER,
-                chat_id=chat_ref,
-                chat_name=str((row or {}).get("display_name") or "Sinda"),
-                chat_type=str((row or {}).get("chat_type") or "dm"),
-                user_id=str((row or {}).get("user_id") or chat_ref),
-                user_name="OJ (Sinda)",
-            )
+            return _error_response("Command dispatch failed", 500, err_type="server_error")
         event = MessageEvent(
             text=command,
             message_type=MessageType.COMMAND,

@@ -225,3 +225,28 @@ class TestPlainTableDispatch:
         assert data["result"] == "STATUS-STUB-OK"
         assert seen == ["status"]
 
+
+class TestSiblingAddressing:
+    @pytest.mark.asyncio
+    async def test_title_targets_addressed_sibling_not_latest(self, zelda_env):
+        """Two Sinda siblings share one peer tuple (a /branch clone copies the parent's).
+        A command addressed at the OLDER sibling must rename THAT row: the engine's
+        peer-fallback recovery previously resolved to the newest sibling (observed live:
+        /title on the alt-plan clone retitled the --here sibling created minutes later).
+        The per-session peer identity + keyed bind makes the exact-key lookup hit the
+        addressed row, so recovery never reaches the ambiguous fallback."""
+        store, adapter, runner = zelda_env
+        older = _seed_sinda_session(store, session_id="20260925_120000_sibl01", title="older-sib")
+        newer = _seed_sinda_session(store, session_id="20260925_120000_sibl02", title="newer-sib")
+        async with TestClient(TestServer(_make_app(adapter, runner))) as client:
+            resp = await client.post(
+                "/api/commands", json={"command": "/title addressed-title"},
+                headers={**{"Authorization": f"Bearer {API_KEY}"}, "X-Hermes-Session-Id": older})
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["handled"] is True
+        assert data["status"] == "ok"
+        # THE DELTA: the ADDRESSED row carries the new title; the sibling is untouched.
+        assert store._db.get_session_title(older) == "addressed-title"
+        assert store._db.get_session_title(newer) == "newer-sib"
+

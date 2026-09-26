@@ -3091,6 +3091,74 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("GET /api/commands failed")
             return _error_response("Failed to enumerate commands", 500, err_type="server_error")
 
+    async def _bind_zelda_session_identity(self, resolved_id: str, row: dict):
+        """ZELDA FORK (2026-09-26 siblingfix): resolve the SessionSource for an id-addressed
+        dispatch, and for SINDA-shaped rows give the row a per-SESSION peer identity plus a
+        one-shot binding to the session key the runner will derive from it.
+
+        Why: the routing engine is KEY-addressed. Sinda rows are unkeyed and share one
+        inherited peer tuple (clones copy the parent's), so when a command handler asks the
+        engine "which session is this source?" the peer fallback recovers the LATEST row with
+        that tuple — any sibling, not the addressed one (observed live: /title on the
+        alt-plan clone retitled the --here sibling created minutes later). A unique
+        ``zelda:<session_id>`` tuple per topic makes the peer identity unambiguous, and
+        stamping the derived key on the row makes the engine's exact-key lookup
+        (find_latest_gateway_session_for_peer's keyed branch) resolve to exactly the
+        addressed row — recovery never reaches the ambiguous peer fallback. Rows with a REAL
+        session key or a real (non-zelda) chat peer keep the stored-origin source path:
+        key-addressed surfaces are untouched, and this runs only for the fork's
+        X-Hermes-Session-Id dispatch paths.
+        """
+        from gateway.session import Platform, SessionSource
+
+        stored_origin_json = (row or {}).get("origin_json")
+        stored_key = str((row or {}).get("session_key") or "").strip()
+        row_chat_id = str((row or {}).get("chat_id") or "").strip()
+        sinda_shaped = (not stored_key) and (not row_chat_id or row_chat_id.startswith("zelda:"))
+        if not sinda_shaped:
+            # Key-addressed row or a real chat peer: preserve the prior stored-origin behavior.
+            if stored_origin_json:
+                try:
+                    return SessionSource.from_dict(json.loads(stored_origin_json))
+                except Exception:
+                    logger.exception("zelda identity: unreadable origin_json on %s", resolved_id)
+                    return None
+            chat_ref = row_chat_id or f"zelda:{resolved_id}"
+            return SessionSource(
+                platform=Platform.API_SERVER,
+                chat_id=chat_ref,
+                chat_type=str((row or {}).get("chat_type") or "dm"),
+                user_id=str((row or {}).get("user_id") or chat_ref),
+                user_name="OJ (Sinda)",
+                chat_name=str((row or {}).get("display_name") or "Sinda"),
+            )
+        chat_ref = f"zelda:{resolved_id}"
+        source = SessionSource(
+            platform=Platform.API_SERVER,
+            chat_id=chat_ref,
+            chat_type=str((row or {}).get("chat_type") or "dm"),
+            user_id=str((row or {}).get("user_id") or chat_ref),
+            user_name="OJ (Sinda)",
+            chat_name=str((row or {}).get("display_name") or "Sinda"),
+        )
+        try:
+            runner = self.gateway_runner
+            if runner is None:
+                from gateway.run import _gateway_runner_ref
+                runner = _gateway_runner_ref()
+            session_key = runner._session_key_for_source(source) if runner is not None else None
+            if session_key:
+                db = await self._ensure_session_db_async()
+                if db is not None:
+                    await asyncio.to_thread(
+                        db.record_gateway_session_peer, resolved_id,
+                        source="api_server", session_key=session_key,
+                        user_id=source.user_id, chat_id=source.chat_id,
+                        chat_type=source.chat_type, thread_id=source.thread_id)
+        except Exception:
+            logger.exception("zelda siblingfix: identity bind failed for %s", resolved_id)
+        return source
+
     @_require_auth
     async def _handle_command_dispatch(self, request: "web.Request") -> "web.Response":
         """POST /api/commands — authenticated slash dispatch into the LIVE gateway runner.
@@ -3149,28 +3217,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return _error_response(
                     f"Session not found: {header_session_id}", 404, code="session_not_found")
             source_session_id = resolved_id
-            # Prefer the row's stored origin (the /new parity handler's preference): origin_json
-            # carries the real surface identity; the id-addressed rows carry a
-            # zelda:<predecessor> peer tuple either way, so the peer finder recovers THIS row.
-            stored_origin_json = (row or {}).get("origin_json")
-            source = None
-            if stored_origin_json:
-                try:
-                    source = SessionSource.from_dict(json.loads(stored_origin_json))
-                except Exception:
-                    logger.exception(
-                        "zelda dispatch: unreadable origin_json on %s", resolved_id)
-                    source = None
+            # ZELDA FORK siblingfix: per-session peer identity + keyed bind so the engine's
+            # handlers resolve THIS row (see _bind_zelda_session_identity for the why).
+            source = await self._bind_zelda_session_identity(resolved_id, row)
             if source is None:
-                chat_ref = str((row or {}).get("chat_id") or f"zelda:{resolved_id}")
-                source = SessionSource(
-                    platform=Platform.API_SERVER,
-                    chat_id=chat_ref,
-                    chat_name=str((row or {}).get("display_name") or "Sinda"),
-                    chat_type=str((row or {}).get("chat_type") or "dm"),
-                    user_id=str((row or {}).get("user_id") or chat_ref),
-                    user_name="OJ (Sinda)",
-                )
+                return _error_response(
+                    "Command dispatch failed: unreadable session identity",
+                    500, err_type="server_error")
         else:
             source = SessionSource(
                 platform=Platform.API_SERVER,
