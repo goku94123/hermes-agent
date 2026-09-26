@@ -3121,14 +3121,65 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from gateway.platforms.event import MessageEvent, MessageType
         from gateway.session import Platform, SessionSource
 
-        source = SessionSource(
-            platform=Platform.API_SERVER,
-            chat_id=session_id or "zelda-fork",
-            chat_name="Zelda Signal Fork",
-            chat_type="dm",
-            user_id="zelda-fork",
-            user_name="OJ (Zelda fork)",
-        )
+        # ZELDA FORK (2026-09-26): id-addressed dispatch. When the caller addresses a session
+        # (X-Hermes-Session-Id header, the Sinda fork's addressing mode), the source MUST be
+        # synthesized from THAT row's stored identity — the hardcoded "zelda-fork" source
+        # generates a session key no Sinda row carries (their rows have NULL session_key and
+        # a zelda:<predecessor> peer tuple), so idle-path commands recovered a fresh phantom
+        # session instead of the caller's conversation. Resolution mirrors the /new parity
+        # handler in api_server_openai_routes.py: adopt the live continuation tip first
+        # (#98619), refuse unknown ids instead of silently minting a row, and prefer the
+        # stored origin (zelda reset stamps richer identity than the request headers carry).
+        header_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        source_session_id = session_id or ""
+        if header_session_id:
+            if self._api_key is None:
+                # Same gate as transcript reads via X-Hermes-Session-Id (openai_routes):
+                # unauthenticated callers must not address arbitrary session ids.
+                return _error_response(
+                    "Session addressing requires API key authentication. "
+                    "Configure API_SERVER_KEY to enable this feature.", 403)
+            from gateway.platforms.api_server_runs import _resolve_live_session_id
+            db = await self._ensure_session_db_async()
+            if db is None:
+                return _error_response("Session store unavailable", 503, err_type="server_error")
+            resolved_id = await _resolve_live_session_id(self, header_session_id)
+            row = await asyncio.to_thread(db.get_session, resolved_id)
+            if row is None:
+                return _error_response(
+                    f"Session not found: {header_session_id}", 404, code="session_not_found")
+            source_session_id = resolved_id
+            # Prefer the row's stored origin (the /new parity handler's preference): origin_json
+            # carries the real surface identity; the id-addressed rows carry a
+            # zelda:<predecessor> peer tuple either way, so the peer finder recovers THIS row.
+            stored_origin_json = (row or {}).get("origin_json")
+            source = None
+            if stored_origin_json:
+                try:
+                    source = SessionSource.from_dict(json.loads(stored_origin_json))
+                except Exception:
+                    logger.exception(
+                        "zelda dispatch: unreadable origin_json on %s", resolved_id)
+                    source = None
+            if source is None:
+                chat_ref = str((row or {}).get("chat_id") or f"zelda:{resolved_id}")
+                source = SessionSource(
+                    platform=Platform.API_SERVER,
+                    chat_id=chat_ref,
+                    chat_name=str((row or {}).get("display_name") or "Sinda"),
+                    chat_type=str((row or {}).get("chat_type") or "dm"),
+                    user_id=str((row or {}).get("user_id") or chat_ref),
+                    user_name="OJ (Sinda)",
+                )
+        else:
+            source = SessionSource(
+                platform=Platform.API_SERVER,
+                chat_id=session_id or "zelda-fork",
+                chat_name="Zelda Signal Fork",
+                chat_type="dm",
+                user_id="zelda-fork",
+                user_name="OJ (Zelda fork)",
+            )
         event = MessageEvent(
             text=command,
             message_type=MessageType.COMMAND,
@@ -3142,11 +3193,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception:
             logger.exception("POST /api/commands dispatch failed for %s", command)
             return _error_response("Command dispatch failed", 500, err_type="server_error")
+        result_text = result if isinstance(result, str) else ""
         return web.json_response({
             "object": "hermes.command.result",
             "command": command,
             "handled": bool(handled),
-            "result": result if isinstance(result, str) else "",
+            "result": result_text,
+            "status": "ok" if handled else "unhandled",
+            "sessionId": source_session_id or (session_id or ""),
         })
 
     async def _dispatch_command_event_for_fork(self, event: "MessageEvent", source: "SessionSource"):
