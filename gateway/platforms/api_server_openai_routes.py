@@ -1798,7 +1798,8 @@ class OpenAICompatRoutesMixin:
             reply += "\n" + "This conversation switched onto the branch; use `/resume` to go back."
         meta = {"object": "hermes.command.result", "command": command, "handled": True,
                 "status": "ok", "result": reply, "sessionId": new_session_id,
-                "branchedFrom": parent_session_id, "branchedTo": new_session_id}
+                "branchedFrom": parent_session_id, "branchedTo": new_session_id,
+                "here": stay_here, "title": branch_title}
 
         if stream:
             completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
