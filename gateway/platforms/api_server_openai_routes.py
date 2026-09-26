@@ -940,7 +940,14 @@ class OpenAICompatRoutesMixin:
             _gate_head = user_message.lstrip().split(maxsplit=1)[0][1:].lower()
             from hermes_cli.commands import resolve_command as _resolve_cmd
             _gate_def = _resolve_cmd(_gate_head) if _gate_head else None
-            if (_gate_def is not None and not getattr(_gate_def, "cli_only", False)
+            # Same membership rule as the native gateway early gate (GATEWAY_KNOWN_COMMANDS):
+            # non-cli_only commands PLUS cli_only commands that carry a gateway_config_gate
+            # (config-gated on-platform commands like /skills stay dispatchable; their
+            # handler enforces the config gate at runtime). A blanket cli_only exclusion
+            # silently dropped commands Telegram answers (ZELDA FORK plainfix, 2026-09-26).
+            if (_gate_def is not None
+                    and ((not getattr(_gate_def, "cli_only", False))
+                         or getattr(_gate_def, "gateway_config_gate", None))
                     and _gate_head not in ("new", "reset", "steer")):
                 if _gate_head == "branch":
                     return await self._handle_zelda_branch(

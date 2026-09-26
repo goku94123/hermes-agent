@@ -3224,11 +3224,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     return (True, result if isinstance(result, str) else None)
         except Exception:
             logger.exception("fork busy dispatch failed; falling back to idle table")
-        # Idle path: the runner's own idle command table.
+        # Idle path: the runner's own idle command table. The PLAIN table (handlers shared
+        # by idle+busy dispatch, e.g. /status /help /stoplocal) is consulted first —
+        # mirrors _hm_dispatch_canonical_command's ordering, and these commands have no
+        # idle-table entry, so skipping it made the fork answer "not available" for
+        # commands Telegram answers fine (ZELDA FORK plainfix, 2026-09-26).
         try:
             handlers = runner._gateway_idle_command_handlers()
             name = event.get_command()
-            handler = handlers.get(name)
+            handler = runner._gateway_plain_command_handlers().get(name) or handlers.get(name)
             if handler is not None:
                 result = await handler(event)
                 return (True, result if isinstance(result, str) else None)

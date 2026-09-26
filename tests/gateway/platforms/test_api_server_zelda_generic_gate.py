@@ -193,3 +193,73 @@ class TestGenericGate:
         assert "hermes_command" not in data
         # ...and the row was NOT renamed (the text went to the LLM, not the handler).
         assert store._db.get_session_title(SINDA_ID) == "orig title"
+
+
+class TestGateMembershipParity:
+    """The gate's membership rule must mirror the native gateway early gate
+    (``GATEWAY_KNOWN_COMMANDS``): non-cli_only commands PLUS cli_only commands that carry a
+    ``gateway_config_gate`` (their handler enforces the config gate at runtime). A blanket
+    ``cli_only`` exclusion silently dropped commands Telegram answers."""
+
+    @pytest.mark.asyncio
+    async def test_plain_table_command_not_unhandled(self, zelda_env, monkeypatch):
+        """/status (plain table, no idle entry) dispatches instead of 'not available'."""
+        store, adapter, runner = zelda_env
+        sid = _seed_sinda_session(store)
+
+        async def _stub_status(event):
+            return "STATUS-STUB-OK"
+
+        monkeypatch.setattr(runner, "_handle_status_command", _stub_status)
+        async with TestClient(TestServer(_make_app(adapter, runner))) as client:
+            resp = await client.post("/v1/chat/completions", json=_chat_body("/status"),
+                                     headers=_AUTH)
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["choices"][0]["message"]["content"] == "STATUS-STUB-OK"
+        meta = data["hermes_command"]
+        assert meta["handled"] is True
+        assert meta["status"] == "ok"
+        assert meta["sessionId"] == sid
+
+    @pytest.mark.asyncio
+    async def test_config_gated_cli_command_intercepted(self, zelda_env, monkeypatch):
+        """/skills is cli_only BUT carries gateway_config_gate — the native gateway admits
+        it, so the fork gate must too (the handler applies the gate at runtime)."""
+        store, adapter, runner = zelda_env
+        sid = _seed_sinda_session(store)
+
+        seen = []
+
+        async def _stub_skills(event):
+            seen.append(event.get_command())
+            return "SKILLS-STUB-OK"
+
+        monkeypatch.setattr(runner, "_handle_skills_command", _stub_skills)
+        async with TestClient(TestServer(_make_app(adapter, runner))) as client:
+            resp = await client.post("/v1/chat/completions", json=_chat_body("/skills"),
+                                     headers=_AUTH)
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["choices"][0]["message"]["content"] == "SKILLS-STUB-OK"
+        assert data["hermes_command"]["handled"] is True
+        assert seen == ["skills"]
+
+    @pytest.mark.asyncio
+    async def test_bare_cli_only_command_still_falls_through(self, zelda_env, monkeypatch):
+        """/handoff is cli_only WITHOUT a config gate — no native gateway dispatch, so the
+        fork gate must keep treating it as plain text."""
+        store, adapter, runner = zelda_env
+        _seed_sinda_session(store)
+
+        async def _fake_run_agent(**kwargs):
+            return ({"final_response": "LLM-REACHED"}, {"input_tokens": 1, "output_tokens": 1})
+
+        monkeypatch.setattr(adapter, "_run_agent", _fake_run_agent)
+        async with TestClient(TestServer(_make_app(adapter, runner))) as client:
+            resp = await client.post("/v1/chat/completions", json=_chat_body("/handoff telegram"),
+                                     headers=_AUTH)
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["choices"][0]["message"]["content"] == "LLM-REACHED"
+        assert "hermes_command" not in data

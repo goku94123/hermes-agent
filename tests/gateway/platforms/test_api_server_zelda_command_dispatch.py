@@ -195,3 +195,33 @@ class TestDispatchAddressesRealSession:
                 headers={"X-Hermes-Session-Id": sid})
             assert resp.status == 401
         assert store._db.get_session_title(sid) == "orig title"
+
+
+class TestPlainTableDispatch:
+    @pytest.mark.asyncio
+    async def test_plain_table_command_reaches_caller(self, zelda_env, monkeypatch):
+        """PLAIN-table commands (shared idle+busy handlers, e.g. /status) dispatch through
+        the fork machinery too. The real idle path consults
+        ``_gateway_plain_command_handlers`` FIRST (``_hm_dispatch_canonical_command``);
+        skipping it answered 'not available' for commands Telegram answers."""
+        store, adapter, runner = zelda_env
+        sid = _seed_sinda_session(store)
+
+        seen = []
+
+        async def _stub_status(event):
+            seen.append(event.get_command())
+            return "STATUS-STUB-OK"
+
+        monkeypatch.setattr(runner, "_handle_status_command", _stub_status)
+        async with TestClient(TestServer(_make_app(adapter, runner))) as client:
+            resp = await client.post(
+                "/api/commands", json={"command": "/status"},
+                headers={**{"Authorization": f"Bearer {API_KEY}"}, "X-Hermes-Session-Id": sid})
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["handled"] is True
+        assert data["status"] == "ok"
+        assert data["result"] == "STATUS-STUB-OK"
+        assert seen == ["status"]
+
