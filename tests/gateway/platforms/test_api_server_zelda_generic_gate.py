@@ -19,6 +19,9 @@ Contracts:
 
 from __future__ import annotations
 
+import json
+import re
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -263,3 +266,39 @@ class TestGateMembershipParity:
             data = await resp.json()
         assert data["choices"][0]["message"]["content"] == "LLM-REACHED"
         assert "hermes_command" not in data
+
+    @pytest.mark.asyncio
+    async def test_streaming_command_frames_carry_metadata(self, zelda_env, monkeypatch):
+        """Streaming gate command (stream=true): content rides the second frame, the
+        structured ``hermes.command.result`` rides the FINAL frame, [DONE] terminates.
+        Regression: the streaming branch once referenced _sse_frame without importing it,
+        500-ing with an empty body before a single frame was written."""
+        store, adapter, runner = zelda_env
+        sid = _seed_sinda_session(store)
+
+        async def _stub_title(event):
+            return "TITLE-STUB-OK"
+
+        monkeypatch.setattr(runner, "_handle_title_command", _stub_title)
+        body = _chat_body("/title stream-check")
+        body["stream"] = True
+        async with TestClient(TestServer(_make_app(adapter, runner))) as client:
+            resp = await client.post("/v1/chat/completions", json=body, headers=_AUTH)
+            assert resp.status == 200
+            raw = await resp.read()
+        frames = [f for f in raw.decode().split("\n\n") if f.strip()]
+        payloads = []
+        for frame in frames:
+            m = re.match(r"^data: (.*)$", frame.strip())
+            assert m, f"non-data SSE frame: {frame!r}"
+            payload = m.group(1)
+            if payload == "[DONE]":
+                continue
+            payloads.append(json.loads(payload))
+        # role frame, content frame, final frame with metadata
+        assert payloads[0]["choices"][0]["delta"] == {"role": "assistant"}
+        assert payloads[1]["choices"][0]["delta"]["content"] == "TITLE-STUB-OK"
+        assert "hermes_command" in payloads[-1]
+        assert payloads[-1]["hermes_command"]["status"] == "ok"
+        assert payloads[-1]["hermes_command"]["sessionId"] == sid
+        assert frames[-1].strip() == "data: [DONE]"

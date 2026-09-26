@@ -1620,7 +1620,10 @@ class OpenAICompatRoutesMixin:
         ``hermes_command`` metadata block (``slash.exec``-style status). Empty handler output
         (handlers that ack via push/banner) gets a short fallback ack so the bubble is never
         blank."""
-        from gateway.platforms.api_server import _error_response
+        # ZELDA FORK (2026-09-26 ssefix): _sse_frame was missing here — every STREAMING
+        # gate command died with NameError -> 500 + empty body (curl exit 18).
+        # Non-streaming never touched it, which is why the first battery missed it.
+        from gateway.platforms.api_server import _error_response, _sse_frame
         from gateway.platforms.api_server_runs import _resolve_live_session_id
         from gateway.platforms.event import MessageEvent, MessageType
         from gateway.session import Platform, SessionSource
