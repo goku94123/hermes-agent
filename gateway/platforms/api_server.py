@@ -4513,6 +4513,55 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             usage["runtime"] = runtime
         return result, usage
 
+    def _build_zelda_clarify_callback(self, notify, session_key):
+        """ZELDA FORK P2.2 (2026-09-27): the ``clarify`` callback for one fork turn.
+
+        Runs on the turn's worker thread (clarify_tool's synchronous contract): register
+        the pending question in ``tools.clarify_gateway`` under the caller's session id,
+        stream it to the client via ``notify`` (the SSE writer turns the payload into an
+        ``event: hermes.clarify`` frame), then block on the shared primitive until a
+        chat-turn answer resolves it (the fork path's intercept) or the configured
+        timeout fires. Timeout/unanswered -> the same "[user did not respond…]" sentinel
+        shape TurnRunner's surface renders; a boundary clear (``/new``) wakes the waiter
+        with "" -> same sentinel. Batch form mirrors TurnRunner: one registration per
+        question, stop at the first the user never answers, JSON payload back.
+        """
+        def _clarify_callback(question, choices, multi_select=False, questions=None):
+            from tools import clarify_gateway as _clarify_mod
+            if questions:
+                answers = {}
+                timed_out = False
+                notice = None
+                for _idx, _entry in enumerate(questions):
+                    _raw, _answered = _clarify_callback(
+                        _entry.get("question", ""), _entry.get("choices"),
+                        bool(_entry.get("multi_select")))
+                    if not _answered:
+                        timed_out = True
+                        notice = _raw
+                        break
+                    answers[_entry.get("qid") or f"q{_idx}"] = _raw
+                return json.dumps({"answers": answers, "timed_out": timed_out,
+                                   **({"notice": notice} if notice else {})},
+                                  ensure_ascii=False)
+            _clarify_id = uuid.uuid4().hex[:10]
+            _safe_choices = list(choices) if choices else None
+            _timeout_s = float(_clarify_mod.get_clarify_timeout())
+            _clarify_mod.register(clarify_id=_clarify_id, session_key=session_key,
+                                  question=question, choices=_safe_choices,
+                                  multi_select=bool(multi_select))
+            try:
+                notify({"clarifyId": _clarify_id, "question": question,
+                        "choices": _safe_choices, "multiSelect": bool(multi_select),
+                        "sessionId": session_key})
+                _response = _clarify_mod.wait_for_response(_clarify_id, timeout=_timeout_s)
+            finally:
+                _clarify_mod.clear_session(session_key)
+            if _response is None or _response == "":
+                return f"[user did not respond within {int(_timeout_s / 60)}m]"
+            return str(_response)
+        return _clarify_callback
+
     async def _run_agent(
         self, user_message: str, conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
@@ -4527,10 +4576,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
-        approval_session_key: Optional[str] = None) -> tuple:
+        approval_session_key: Optional[str] = None,
+        clarify_notify_callback=None, clarify_session_key: Optional[str] = None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``approval_notify_callback`` (with ``approval_session_key``) routes dangerous-command
         approval requests to the caller's stream, keyed like ``/v1/runs`` approvals (#51871).
+        ``clarify_notify_callback`` (with ``clarify_session_key``) is the ZELDA FORK P2.2
+        clarify surface: when set, ``agent.clarify_callback`` is wired so the ``clarify``
+        tool's questions stream to the caller (``hermes.clarify`` SSE event) and the answer
+        resolves via a normal chat turn (the fork path's intercept). Without it this surface
+        has no clarify support at all — TurnRunner never runs here, and the base
+        numbered-text fallback rides a ``send()`` stub that cannot deliver.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
         provider/model must match or the turn fails; ``runtime`` metadata is attached.
@@ -4573,6 +4629,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    # ZELDA FORK P2.2 (2026-09-27): wire the clarify surface. The callback
+                    # runs on THIS worker thread (clarify_tool's synchronous contract):
+                    # register the pending question, stream it to the client via the notify
+                    # closure, then block on the shared primitive until a chat-turn answer
+                    # resolves it (or the configured timeout fires — "" response, same
+                    # sentinel contract TurnRunner's _ask_clarify_question renders).
+                    if clarify_notify_callback is not None and clarify_session_key:
+                        agent.clarify_callback = self._build_zelda_clarify_callback(
+                            clarify_notify_callback, clarify_session_key)
                     if resume_unanswered_turn:
                         # A dispatcher's re-run of a failed delivery turn: the DM's own row is already
                         # in the store (the failed attempt persisted it at turn start), so continue THAT

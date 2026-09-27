@@ -683,6 +683,20 @@ class OpenAICompatRoutesMixin:
             requested_provider=overrides.get("requested_provider"), route=route)
         return route, overrides, (_error_response(err, 400) if err else None)
 
+    def _make_zelda_clarify_notify(self, stream_q) -> Any:
+        """ZELDA FORK P2.2 (2026-09-27): build the clarify notify for one SSE turn.
+
+        Returned callback signature: ``(payload_dict, loop)`` — called from the agent worker
+        thread inside ``_run_agent``'s clarify callback. Puts a ``("__clarify__", payload)``
+        tuple on this turn's stream queue (same thread-safe lane as tool progress); the SSE
+        writer turns it into an ``event: hermes.clarify`` frame. ``loop`` (the request loop,
+        captured at turn start) is accepted for signature symmetry with the approval notify;
+        ThreadSafeAsyncQueue needs no loop to enqueue.
+        """
+        def _notify(payload: Dict[str, Any], _loop=None) -> None:
+            stream_q.put_threadsafe(("__clarify__", payload))
+        return _notify
+
     def _register_stream_approval(self, request, completion_id, stream_q, session_id) -> tuple:
         """Expose a streaming completion as a run for ``POST /v1/runs/{completion_id}/approval``
         (#51871) -> ``(notify, on_done)``. Owner + status are stamped like the session stream, so
@@ -975,6 +989,77 @@ class OpenAICompatRoutesMixin:
                 return await self._handle_zelda_command_dispatch(
                     request, command=user_message.strip(), cmd_def=_gate_def,
                     session_id=session_id, gateway_session_key=gateway_session_key, stream=stream)
+        # ZELDA FORK P2.2 (2026-09-27): clarify answer intercept — a turn whose agent asked a
+        # clarify question owns this session until the answer lands. Consume the reply HERE
+        # (resolve the pending entry, ACK with an empty completion) instead of spawning a
+        # second agent on top of the blocked one. Mirrors run_inbound._hm_clarify_reply:
+        # slash commands fall through to the gate (the clarify stays armed), invalid
+        # selections keep it armed for a retry, free prose on a native-choice prompt
+        # resolves as "Other" (never dead-end the user's words). The REAL continuation
+        # streams on the still-open original POST; the ack carries no content deltas, so
+        # the fork renders no bubble for it.
+        if (request.headers.get("X-Zelda-Client", "").strip() == "1" and provided_session_id
+                and isinstance(user_message, str) and user_message.strip()
+                and not user_message.strip().startswith("/")):
+            from gateway.platforms.api_server import _sse_frame as _sse_frame_zelda
+            from tools import clarify_gateway as _clarify_mod
+            try:
+                _pending = _clarify_mod.get_pending_for_session(session_id, include_choice_prompts=True)
+            except Exception:
+                logger.debug("zelda clarify intercept: registry unavailable", exc_info=True)
+                _pending = None
+            if _pending is not None:
+                _outcome = _clarify_mod.attempt_text_response_for_session(session_id, user_message.strip())
+                if _outcome == _clarify_mod.TEXT_REJECTED_PROSE:
+                    # Prose on a choice prompt = "Other": resolve with the user's words.
+                    if _clarify_mod.resolve_gateway_clarify(_pending.clarify_id, user_message.strip()):
+                        _outcome = _clarify_mod.TEXT_RESOLVED
+                if _outcome == _clarify_mod.TEXT_RESOLVED:
+                    logger.info("Zelda fork clarify answered (session=%s, id=%s)",
+                                session_id, _pending.clarify_id)
+                    return await self._zelda_clarify_ack(request, session_id=session_id,
+                                                         gateway_session_key=gateway_session_key,
+                                                         stream=stream)
+                if _outcome == _clarify_mod.TEXT_REJECTED_SELECTION:
+                    # Keep the clarify armed; teach the answer format (4018-style).
+                    _hint = ("Reply with the number (1-%d) or the option text."
+                             % max(1, len(_pending.choices or [])))
+                    if _pending.multi_select:
+                        _hint = "Reply with the numbers separated by commas (e.g. \"1, 3\") or the option text."
+                    _meta = {"object": "hermes.command.result", "command": "clarify",
+                             "handled": True, "status": "rejected",
+                             "result": _hint, "sessionId": session_id}
+                    if stream:
+                        _completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+                        _created = int(time.time())
+                        response = await self._prepare_sse_response(request, session_id, gateway_session_key)
+
+                        def _hint_chunk(delta, finish_reason=None, **extra):
+                            return {"id": _completion_id, "object": "chat.completion.chunk",
+                                    "created": _created, "model": self._model_name,
+                                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+                        try:
+                            await response.write(_sse_frame_zelda(_hint_chunk({"role": "assistant"})))
+                            await response.write(_sse_frame_zelda(_hint_chunk({"content": _hint})))
+                            await response.write(_sse_frame_zelda(_hint_chunk({}, "stop", usage={
+                                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                                **{"hermes_command": _meta})))
+                            await response.write(b"data: [DONE]\n\n")
+                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                            logger.info("zelda clarify hint: SSE client disconnected")
+                        return response
+                    return web.json_response({
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion",
+                        "created": int(time.time()), "model": self._model_name,
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": _hint},
+                                     "finish_reason": "stop"}],
+                        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                        "hermes_command": _meta,
+                    })
+                # TEXT_NO_PENDING (race lost to a callback resolution): fall through to the
+                # normal turn — the blocked agent is already unblocked, so the follow-up
+                # queues naturally behind the continuation.
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -1007,6 +1092,16 @@ class OpenAICompatRoutesMixin:
             # "running" run with no agent behind it.
             run_kwargs["active_run_id"] = completion_id
             _stream_q = ThreadSafeAsyncQueue()
+            # ZELDA FORK P2.2 (2026-09-27): interactive components — the clarify tool has NO
+            # callback on this surface (only TurnRunner wires one), and APIServerAdapter.send()
+            # is a stub, so an agent clarify blocked forever with the question never reaching
+            # the phone. When the caller is the Sinda fork, wire a callback that streams the
+            # question as an SSE ``hermes.clarify`` event and blocks on the shared clarify
+            # primitive (answer rides a normal chat turn — see the intercept below). Header-
+            # gated: other API clients keep today's clarify-unavailable behavior.
+            if (request.headers.get("X-Zelda-Client", "").strip() == "1" and provided_session_id):
+                run_kwargs["clarify_session_key"] = session_id
+                run_kwargs["clarify_notify_callback"] = self._make_zelda_clarify_notify(_stream_q)
             # tool_call_ids with an emitted "running": a "completed" without one (internal/
             # filtered tools) is dropped rather than orphaned on the wire.
             _started_tool_call_ids: set[str] = set()
@@ -1267,6 +1362,11 @@ class OpenAICompatRoutesMixin:
                     await response.write(_sse_frame(delta[1], event="hermes.status"))
                 elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__approval__":
                     await response.write(_sse_frame(delta[1], event="approval.request"))
+                elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__clarify__":
+                    # ZELDA FORK P2.2: interactive component payload — the clarify question as
+                    # {clarifyId, question, choices, multiSelect, sessionId}. The fork renders
+                    # a native answer surface; the typed answer rides a normal chat turn.
+                    await response.write(_sse_frame(delta[1], event="hermes.clarify"))
                 else:
                     if delta:
                         content_sent = True
@@ -1760,6 +1860,43 @@ class OpenAICompatRoutesMixin:
             "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion",
             "created": int(time.time()), "model": self._model_name,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": result_text},
+                         "finish_reason": "stop"}],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "hermes_command": meta,
+        })
+
+    async def _zelda_clarify_ack(
+            self, request: "web.Request", *, session_id: str,
+            gateway_session_key: Optional[str], stream: bool) -> "web.Response":
+        """ZELDA FORK P2.2: minimal OpenAI-compatible completion for a consumed clarify
+        answer. ZERO content deltas (the fork renders no bubble) — the real continuation
+        streams on the still-open original POST. ``hermes_command`` metadata carries
+        status=ok so diagnostics can see the intercept fired."""
+        from gateway.platforms.api_server import _sse_frame
+        meta = {"object": "hermes.command.result", "command": "clarify",
+                "handled": True, "status": "ok", "result": "",
+                "sessionId": session_id}
+        if stream:
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            created = int(time.time())
+            response = await self._prepare_sse_response(request, session_id, gateway_session_key)
+
+            def _ack_chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
+                return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                        "model": self._model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+            try:
+                await response.write(_sse_frame(_ack_chunk({}, "stop", usage={
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    **{"hermes_command": meta})))
+                await response.write(b"data: [DONE]\n\n")
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                logger.info("zelda clarify ack: SSE client disconnected")
+            return response
+        return web.json_response({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion",
+            "created": int(time.time()), "model": self._model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": ""},
                          "finish_reason": "stop"}],
             "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             "hermes_command": meta,
