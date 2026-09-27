@@ -693,6 +693,21 @@ class OpenAICompatRoutesMixin:
         **{w: ("deny", "") for w in ("deny", "no", "n", "cancel", "stop", "disallow")},
     }
 
+    # ZELDA FORK P2.7: map any component-shaped surface onto the ONE generic payload the
+    # fork's data-driven sheet renders (event: hermes.component). Adding a future
+    # interactive surface = one entry here + an emit, zero fork updates.
+    @staticmethod
+    def _zelda_component_payload(kind: str, *, title: str, body: str,
+                                 choices: Optional[List[Dict[str, str]]] = None,
+                                 multi_select: bool = False,
+                                 fallback_text: str = "") -> Dict[str, Any]:
+        return {
+            "kind": kind, "title": title, "body": body,
+            "choices": choices or [],
+            "multiSelect": multi_select,
+            "fallbackText": fallback_text or body or title,
+        }
+
     def _make_zelda_clarify_notify(self, stream_q) -> Any:
         """ZELDA FORK P2.2 (2026-09-27): build the clarify notify for one SSE turn.
 
@@ -702,9 +717,19 @@ class OpenAICompatRoutesMixin:
         writer turns it into an ``event: hermes.clarify`` frame. ``loop`` (the request loop,
         captured at turn start) is accepted for signature symmetry with the approval notify;
         ThreadSafeAsyncQueue needs no loop to enqueue.
+        P2.7: the notify ALSO emits the GENERIC component payload (``hermes.component``),
+        so a fork new enough to render it natively shows the data-driven sheet; older
+        forks keep using the dedicated ``hermes.clarify`` event (the app dedupes).
         """
         def _notify(payload: Dict[str, Any], _loop=None) -> None:
             stream_q.put_threadsafe(("__clarify__", payload))
+            choices = payload.get("choices") or []
+            stream_q.put_threadsafe(("__zelda_component__", self._zelda_component_payload(
+                "clarify", title=payload.get("question", "A question for you"),
+                body=payload.get("question", ""),
+                choices=[{"label": c} for c in choices],
+                multi_select=bool(payload.get("multiSelect")),
+                fallback_text=payload.get("question", ""))))
         return _notify
 
     def _register_stream_approval(self, request, completion_id, stream_q, session_id) -> tuple:
@@ -722,6 +747,23 @@ class OpenAICompatRoutesMixin:
             self._set_run_status(completion_id, "waiting_for_approval", last_event="approval.request",
                                  approval=event)
             stream_q.put_threadsafe(("__approval__", event))
+            # ZELDA FORK P2.7: ALSO emit the GENERIC component payload — a fork new enough
+            # to render hermes.component natively shows the data-driven Approve/Deny sheet
+            # (with the real allow_session/allow_permanent scopes); older forks keep the
+            # dedicated approval.request event. The app dedupes (component id == request_id).
+            _c = [{"label": "Approve once", "style": "primary", "answer": "approve"}]
+            if event.get("allow_session") is not False:
+                _c.append({"label": "Approve for this session", "style": "primary",
+                           "answer": "approve session"})
+            if event.get("allow_permanent") is not False:
+                _c.append({"label": "Always approve", "style": "primary",
+                           "answer": "approve always"})
+            _c.append({"label": "Deny", "style": "danger", "answer": "deny"})
+            stream_q.put_threadsafe(("__zelda_component__", self._zelda_component_payload(
+                "approval", title=event.get("description") or "Approval needed",
+                body=(event.get("command") or ""),
+                choices=_c, multi_select=False,
+                fallback_text=str(event.get("command") or ""))))
 
         def _on_done(fut):
             from gateway.platforms.api_server_runs import terminal_run_status
@@ -1424,6 +1466,13 @@ class OpenAICompatRoutesMixin:
                     # ZELDA FORK: voice-note transcript emitted by the collect stage BEFORE
                     # the model runs — Telegram transcript ordering on the wire.
                     await response.write(_sse_frame(delta[1], event="zelda.transcript"))
+                elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__zelda_component__":
+                    # ZELDA FORK P2.7: generic interactive component — ONE self-describing
+                    # payload {kind, title, body, choices[{label, style}], multiSelect,
+                    # fallbackText} that the fork's generic sheet renders data-driven.
+                    # Future gateway-side components (clarify/approval shims are the first
+                    # two) need NO fork update: emit this event, Sinda renders it.
+                    await response.write(_sse_frame(delta[1], event="hermes.component"))
                 elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__reasoning__":
                     # DeepSeek-style ``delta.reasoning_content`` (#99552), the field Open WebUI,
                     # opencode and the Vercel AI SDK render as a thinking block.
