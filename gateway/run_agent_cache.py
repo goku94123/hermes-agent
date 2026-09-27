@@ -32,6 +32,32 @@ _OVERRIDE_APPLY_KEYS = (
 )
 
 
+def _heal_override_wire_pair(override: Dict[str, Any]) -> None:
+    """Re-derive ``api_mode`` when the persisted ``base_url`` and the freshly resolved mode
+    disagree on the wire protocol. A /model switch records the endpoint the session actually
+    ran on (e.g. Synthetic's ``/anthropic`` Messages route), while provider re-resolution after
+    a restart can return the OpenAI-compatible route's ``chat_completions``; layering one over
+    the other POSTs chat/completions bodies to a Messages-only endpoint and 404s on every turn
+    (surfaced as the misleading "didn't answer after N attempts"). The recorded URL is what the
+    session used successfully, so it wins; a host-mandated wire re-aligns the mode. No-op when
+    either side is absent or they already agree. # zelda-wire-heal
+    """
+    url = str(override.get("base_url") or "").strip()
+    mode = override.get("api_mode")
+    if not url or not mode:
+        return
+    from hermes_cli.providers import host_mandated_api_mode
+    from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+    mandated = host_mandated_api_mode(url) or _detect_api_mode_for_url(url)
+    if mandated and mode != mandated:
+        logger.info(
+            "Healed /model override wire pair: base_url=%s implies api_mode=%s (had %s)",
+            url, mandated, mode,
+        )
+        override["api_mode"] = mandated
+
+
 def _first_agent(entry: Any) -> Any:
     """Unwrap a cache entry (``(agent, sig, ...)`` tuple or bare agent) to its agent."""
     return entry[0] if isinstance(entry, tuple) and entry else entry
@@ -182,6 +208,7 @@ class GatewayAgentCacheMixin:
                     # api_mode was just re-derived from the target model; a relay URL persisted by an older
                     # build for another wire (/v1-stripped) or the other family is healed to match (#96066).
                     override["base_url"] = normalize_opencode_base_url(provider, override.get("api_mode"), override["base_url"])
+                _heal_override_wire_pair(override)
             except Exception:
                 logger.debug(
                     "Credential re-resolution failed for persisted override "
@@ -205,6 +232,7 @@ class GatewayAgentCacheMixin:
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        _heal_override_wire_pair(runtime_kwargs)
         # request_overrides reflects the switched-to provider; apply whenever the override recorded
         # it (even as None) so switching to a provider without configured overrides clears a stale
         # value left by the default provider's runtime resolution.
