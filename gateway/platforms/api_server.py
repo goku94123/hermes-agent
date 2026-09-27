@@ -4533,9 +4533,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 timed_out = False
                 notice = None
                 for _idx, _entry in enumerate(questions):
-                    _raw, _answered = _clarify_callback(
+                    # Recursive call returns the user's reply STRING (or the timeout sentinel) —
+                    # never a 2-tuple. Unpacking it blew up ("too many values to unpack") on the
+                    # first real batch question (hf40 verify, session probe_fa426da660).
+                    _raw = _clarify_callback(
                         _entry.get("question", ""), _entry.get("choices"),
                         bool(_entry.get("multi_select")))
+                    _answered = not (_raw is None or (isinstance(_raw, str) and _raw.startswith("[user did not respond")))
                     if not _answered:
                         timed_out = True
                         notice = _raw
