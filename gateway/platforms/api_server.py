@@ -4577,7 +4577,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         relay_metadata: Optional[Dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
         approval_session_key: Optional[str] = None,
-        clarify_notify_callback=None, clarify_session_key: Optional[str] = None) -> tuple:
+        clarify_notify_callback=None, clarify_session_key: Optional[str] = None,
+        zelda_approval_alias_key: Optional[str] = None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``approval_notify_callback`` (with ``approval_session_key``) routes dangerous-command
         approval requests to the caller's stream, keyed like ``/v1/runs`` approvals (#51871).
@@ -4680,13 +4681,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         from tools.approval_context import set_current_session_key
                         approval_token = set_current_session_key(approval_session_key)
                         register_gateway_notify(approval_session_key, approval_notify_callback)
+                        # ZELDA FORK P2.3: alias the notify under the caller's SESSION id too.
+                        # _run_agent_sync keys the registry by RUN id, so a typed fork answer
+                        # could never find the waiter; the fork's intercept resolves via the
+                        # session key. Both aliases pop through _unregister_approval_notify.
+                        if zelda_approval_alias_key and zelda_approval_alias_key != approval_session_key:
+                            register_gateway_notify(zelda_approval_alias_key, approval_notify_callback)
                     try:
                         with notification_turn(agent, muted=muted, session_id=session_id or ""):
                             result = agent.run_conversation(**conversation_kwargs)
                     finally:
                         if approval_token is not None:
                             from tools.approval_context import reset_current_session_key
-                            _api_runs._unregister_approval_notify(approval_session_key)
+                            _api_runs._unregister_approval_notify(approval_session_key,
+                                                                  extra_keys=[zelda_approval_alias_key])
                             with suppress(Exception):
                                 reset_current_session_key(approval_token)
                     result, usage = self._finish_turn_result(

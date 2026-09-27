@@ -683,6 +683,16 @@ class OpenAICompatRoutesMixin:
             requested_provider=overrides.get("requested_provider"), route=route)
         return route, overrides, (_error_response(err, 400) if err else None)
 
+    # ZELDA FORK P2.3: plain-text approval words while a dangerous-command approval
+    # blocks the session — same mapping as run_busy._PLAINTEXT_APPROVAL_WORDS (Signal/
+    # SMS users type "yes", not "/approve"). Gated on has_blocking_approval upstream.
+    _ZELDA_APPROVAL_WORDS = {
+        **{w: ("approve", "") for w in ("approve", "yes", "ok", "okay", "confirm", "y", "👍")},
+        **{w: ("approve", "always") for w in ("always", "approve always", "always approve")},
+        **{w: ("approve", "session") for w in ("session", "approve session", "session approve")},
+        **{w: ("deny", "") for w in ("deny", "no", "n", "cancel", "stop", "disallow")},
+    }
+
     def _make_zelda_clarify_notify(self, stream_q) -> Any:
         """ZELDA FORK P2.2 (2026-09-27): build the clarify notify for one SSE turn.
 
@@ -989,6 +999,62 @@ class OpenAICompatRoutesMixin:
                 return await self._handle_zelda_command_dispatch(
                     request, command=user_message.strip(), cmd_def=_gate_def,
                     session_id=session_id, gateway_session_key=gateway_session_key, stream=stream)
+        # ZELDA FORK P2.3 (2026-09-27): approval answer intercept — while a dangerous-command
+        # approval blocks this session's agent, a plain fork chat turn is consumed as the
+        # decision (same lane as run_busy._route_plaintext_approval_while_busy for native
+        # platforms, and the same word map). Approval words resolve the OLDEST pending
+        # approval for the session; /deny [reason] / /approve [session|always] [all] carry
+        # modifiers. Slash commands and ordinary prose fall through untouched.
+        if (request.headers.get("X-Zelda-Client", "").strip() == "1" and provided_session_id
+                and isinstance(user_message, str) and user_message.strip()):
+            from tools.approval import has_blocking_approval as _has_blocking_approval
+            try:
+                _approval_blocked = _has_blocking_approval(session_id)
+            except Exception:
+                logger.debug("zelda approval intercept: registry unavailable", exc_info=True)
+                _approval_blocked = False
+            if _approval_blocked:
+                from tools import approval as _appr_mod
+                _text = user_message.strip()
+                _lower = _text.lower()
+                if _lower.startswith("/"):
+                    _parts = _lower.split(maxsplit=1)
+                    _head = _parts[0][1:]
+                    _rest = user_message.strip()[len(_parts[0]):].strip()
+                else:
+                    _word = self._ZELDA_APPROVAL_WORDS.get(_lower)
+                    if _word is None:
+                        _head, _rest = None, ""
+                    else:
+                        _head, _rest = _word
+                if _head in ("approve", "deny"):
+                    _choice = "deny"
+                    _reason = None
+                    _resolve_all = False
+                    if _head == "deny":
+                        _tokens = _rest.split()
+                        if _tokens and _tokens[0].lower() == "all":
+                            _resolve_all = True
+                            _rest = _rest[len(_tokens[0]):].strip()
+                        _reason = _rest or None
+                    else:
+                        for _tok in _rest.lower().split():
+                            if _tok == "all":
+                                _resolve_all = True
+                            elif _tok == "always":
+                                _choice = "always"
+                            elif _tok == "session":
+                                _choice = "session"
+                    _resolved_n = _appr_mod.resolve_gateway_approval(
+                        session_id, _choice, resolve_all=_resolve_all, reason=_reason)
+                    if _resolved_n > 0:
+                        logger.info("Zelda fork approval answered (session=%s, choice=%s, n=%d)",
+                                    session_id, _choice, _resolved_n)
+                        return await self._zelda_clarify_ack(
+                            request, session_id=session_id, gateway_session_key=gateway_session_key,
+                            stream=stream)
+                    # Nothing actually pending anymore (race lost) — fall through.
+
         # ZELDA FORK P2.2 (2026-09-27): clarify answer intercept — a turn whose agent asked a
         # clarify question owns this session until the answer lands. Consume the reply HERE
         # (resolve the pending entry, ACK with an empty completion) instead of spawning a
@@ -1102,6 +1168,10 @@ class OpenAICompatRoutesMixin:
             if (request.headers.get("X-Zelda-Client", "").strip() == "1" and provided_session_id):
                 run_kwargs["clarify_session_key"] = session_id
                 run_kwargs["clarify_notify_callback"] = self._make_zelda_clarify_notify(_stream_q)
+                # ZELDA FORK P2.3: approvals — also register the approval notify under the
+                # session id so the fork's typed answer (chat route) can resolve the wait;
+                # the default registry key is the run id, invisible to the next chat turn.
+                run_kwargs["zelda_approval_alias_key"] = session_id
             # tool_call_ids with an emitted "running": a "completed" without one (internal/
             # filtered tools) is dropped rather than orphaned on the wire.
             _started_tool_call_ids: set[str] = set()

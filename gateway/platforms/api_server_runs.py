@@ -1003,12 +1003,15 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         _retire_live_run(self, run_id)
 
 
-def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
+def _unregister_approval_notify(approval_session_key: Optional[str], extra_keys=None) -> None:
     """Best-effort release of a run's approval waiter (no-op without a key)."""
     with suppress(Exception):
         from tools.approval import unregister_gateway_notify
         if approval_session_key:
             unregister_gateway_notify(approval_session_key)
+        for _alias in (extra_keys or []):
+            if _alias and _alias != approval_session_key:
+                unregister_gateway_notify(_alias)
 
 
 def _release_run_owner_if_forgotten(self, run_id: str) -> None:
