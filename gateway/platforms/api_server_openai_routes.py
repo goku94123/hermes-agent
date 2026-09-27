@@ -711,6 +711,14 @@ class OpenAICompatRoutesMixin:
                 status = terminal_run_status(result)[0] if isinstance(result, dict) else "completed"
             self._set_run_status(completion_id, status)
             self._release_run_owner_if_forgotten(completion_id)
+            # ZELDA FORK runlane (2026-09-27): retire the streaming run row on completion —
+            # a forever-"running" phantom row would make the fork's /stop parity handler
+            # interrupt a dead run (or report a stale slot) instead of falling through to
+            # the idle "No active task to stop." answer.
+            with suppress(Exception):
+                from gateway.platforms.api_server_runs import _forget_run
+                _forget_run(self, completion_id, self._active_run_agents, self._active_run_tasks,
+                            self._run_approval_sessions, self._run_statuses, self._run_owners)
         return _approval_notify, _on_done
 
     def _spawn_stream_agent(self, stream_q, *, on_done=None, **run_kwargs) -> tuple:
@@ -953,6 +961,17 @@ class OpenAICompatRoutesMixin:
                     return await self._handle_zelda_branch(
                         request, command=user_message.strip(),
                         session_id=session_id, gateway_session_key=gateway_session_key, stream=stream)
+                # ZELDA FORK runlane (2026-09-27): /stop is dedicated like steer/new/reset —
+                # the gate's runner-lane dispatch can't see runs on THIS adapter's run lane
+                # (_active_run_agents, keyed by run id), so it answered "No active task to
+                # stop." mid-turn while the turn kept running. The dedicated handler
+                # resolves the run lane first and falls back to the gate for runner-lane
+                # sessions (and for the idle "No active task to stop." answer).
+                if _gate_head == "stop":
+                    return await self._handle_zelda_stop(
+                        request, command=user_message.strip(), cmd_def=_gate_def,
+                        session_id=session_id, gateway_session_key=gateway_session_key,
+                        stream=stream)
                 return await self._handle_zelda_command_dispatch(
                     request, command=user_message.strip(), cmd_def=_gate_def,
                     session_id=session_id, gateway_session_key=gateway_session_key, stream=stream)
@@ -980,6 +999,13 @@ class OpenAICompatRoutesMixin:
         if provided_session_id and body.get("hermes_notification_category") == "diagnostic":
             run_kwargs["notification_category"] = "diagnostic"
         if stream:
+            # ZELDA FORK runlane (2026-09-27): register the streaming agent under the run id
+            # the same way /v1/runs registers its agents (``_run_agent`` sets and pops
+            # ``_active_run_agents[active_run_id]``). The status row already exists via
+            # _register_stream_approval; without the agent slot, every control path
+            # (/steer, POST /v1/runs/{id}/stop, the fork's /stop parity handler) found a
+            # "running" run with no agent behind it.
+            run_kwargs["active_run_id"] = completion_id
             _stream_q = ThreadSafeAsyncQueue()
             # tool_call_ids with an emitted "running": a "completed" without one (internal/
             # filtered tools) is dropped rather than orphaned on the wire.
@@ -1608,6 +1634,175 @@ class OpenAICompatRoutesMixin:
             "object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
     # -- ZELDA FORK: /new + /reset parity for the id-addressed Signal fork (Sinda) --------
+
+    # ZELDA FORK: /stop parity for the id-addressed Signal fork (Sinda) -------------------
+    # ZELDA FORK runlane (2026-09-27): /stop through the generic gate dispatched into the
+    # runner's session-KEY lane (_running_agents) while Sinda's live turns execute on THIS
+    # adapter's run lane (_active_run_agents, keyed by run id) — an id-addressed fork session
+    # never holds a runner slot, so /stop always answered "No active task to stop." while the
+    # turn kept running (same phantom-lane class the /steer parity handler fixed; the steer
+    # docstring even names the /stop-shaped hole). The runner's own chat-scope fallback scans
+    # only _snapshot_running_agents, so it cannot reach these runs either. Mirrors
+    # _handle_zelda_steer: resolve the id to its live continuation tip, find the newest
+    # nonterminal run on THAT session, hard-interrupt its agent and reap this run's
+    # background processes exactly like POST /v1/runs/{run_id}/stop. The gate's runner
+    # dispatch stays as the fallback for runner-lane commands.
+    async def _handle_zelda_stop(
+            self, request: "web.Request", *, command: str, cmd_def,
+            session_id: str, gateway_session_key: Optional[str], stream: bool) -> "web.Response":
+        from agent.i18n import t
+        from agent.interrupt_compat import request_hard_interrupt
+        from gateway.platforms.api_server import _error_response, _sse_frame
+        from gateway.platforms.api_server_runs import (
+            TERMINAL_STATUSES as _RUN_TERMINAL, _resolve_live_session_id)
+        from gateway.platforms.event import MessageEvent, MessageType
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return _error_response(
+                "Session addressing requires API key authentication. "
+                "Configure API_SERVER_KEY to enable this feature.", 403)
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return _error_response("Session store unavailable", 503, err_type="server_error")
+        resolved_id = await _resolve_live_session_id(self, session_id)
+        row = await asyncio.to_thread(db.get_session, resolved_id)
+        if row is None:
+            return _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
+        source = await self._bind_zelda_session_identity(resolved_id, row)
+        if source is None:
+            return _error_response("Command dispatch failed", 500, err_type="server_error")
+
+        async def _gate_dispatch(_result: str) -> "web.Response":
+            # Fallback to the standard gate path (runner lane) with a pre-seeded result text:
+            # a live run on the runner's own lane is still stopped by the real /stop handler.
+            event = MessageEvent(
+                text=command, message_type=MessageType.COMMAND,
+                user_id=source.user_id, user_name=source.user_name, source=source,
+                message_id=f"zelda-{int(time.time()*1000)}")
+            try:
+                handled, result = await self._dispatch_command_event_for_fork(event, source)
+            except Exception:
+                logger.exception("zelda /stop fallback dispatch failed for %s", command)
+                return _error_response("Command dispatch failed", 500, err_type="server_error")
+            result_text = result if isinstance(result, str) else ""
+            if not result_text:
+                result_text = _result
+            return await self._zelda_command_response(
+                request, command=command, cmd_def=cmd_def, resolved_id=resolved_id,
+                result_text=result_text, handled=handled, stream=stream,
+                gateway_session_key=gateway_session_key)
+
+        live_runs = [
+            (rid, status) for rid, status in self._run_statuses.items()
+            if status.get("session_id") == resolved_id
+            and status.get("status") not in _RUN_TERMINAL]
+        if not live_runs:
+            # No run-lane turn on this session — fall through to the runner-lane dispatch
+            # so runner-held sessions still stop normally (idle: "No active task to stop.").
+            return await _gate_dispatch(t("gateway.stop.no_active"))
+
+        run_id, status = max(
+            live_runs, key=lambda kv: kv[1].get("updated_at", 0)
+            if isinstance(kv[1].get("updated_at"), (int, float)) else 0)
+        agent = self._active_run_agents.get(run_id)
+        if agent is None:
+            # The agent registers inside the worker thread a beat after the run row appears;
+            # a /stop racing that window waits briefly instead of missing a real turn.
+            for _ in range(10):
+                await asyncio.sleep(0.2)
+                agent = self._active_run_agents.get(run_id)
+                if agent is not None or (
+                        self._run_statuses.get(run_id, {}).get("status") in _RUN_TERMINAL):
+                    break
+        if agent is None:
+            # Run row exists but the agent slot is gone (crashed wrapper, shutdown sweep):
+            # treat as terminal so /stop doesn't lie about stopping a phantom.
+            logger.warning("zelda /stop: run %s nonterminal but has no active agent", run_id)
+            return await _gate_dispatch(t("gateway.stop.no_active"))
+        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+        self._stopping_run_ids.add(run_id)
+        with suppress(Exception):
+            request_hard_interrupt(agent, "Stop requested via /stop", tool_reason="stop command")
+        with suppress(Exception):
+            self._reap_disconnected_agent_processes(agent, source="api_server_zelda_stop")
+        result_text = t("gateway.stop.stopped")
+        meta = {"object": "hermes.command.result", "command": command,
+                "handled": True, "status": "ok", "result": result_text,
+                "sessionId": resolved_id, "runId": run_id}
+        logger.info("Zelda fork /stop: interrupted run %s on session %s", run_id, resolved_id)
+
+        if stream:
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            created = int(time.time())
+            model_name = self._model_name
+
+            def _chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
+                return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+
+            response = await self._prepare_sse_response(request, resolved_id, gateway_session_key)
+            try:
+                await response.write(_sse_frame(_chunk({"role": "assistant"})))
+                await response.write(_sse_frame(_chunk({"content": result_text})))
+                await response.write(_sse_frame(_chunk({}, "stop", usage={
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    **{"hermes_command": meta})))
+                await response.write(b"data: [DONE]\n\n")
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                logger.info("zelda /stop: SSE client disconnected mid-command (%s)", command)
+            return response
+
+        return web.json_response({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion",
+            "created": int(time.time()), "model": self._model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": result_text},
+                         "finish_reason": "stop"}],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "hermes_command": meta,
+        })
+
+    async def _zelda_command_response(
+            self, request: "web.Request", *, command: str, cmd_def, resolved_id: str,
+            result_text: str, handled: bool, stream: bool,
+            gateway_session_key: Optional[str]) -> "web.Response":
+        """Shared OpenAI-compatible response for gate command results (stream + json)."""
+        from gateway.platforms.api_server import _sse_frame
+        meta = {"object": "hermes.command.result", "command": command,
+                "handled": bool(handled), "status": "ok" if handled else "unhandled",
+                "result": result_text, "sessionId": resolved_id}
+        if stream:
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            created = int(time.time())
+            model_name = self._model_name
+
+            def _chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
+                return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+
+            response = await self._prepare_sse_response(request, resolved_id, gateway_session_key)
+            try:
+                await response.write(_sse_frame(_chunk({"role": "assistant"})))
+                await response.write(_sse_frame(_chunk({"content": result_text})))
+                await response.write(_sse_frame(_chunk({}, "stop", usage={
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    **{"hermes_command": meta})))
+                await response.write(b"data: [DONE]\n\n")
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                logger.info("zelda gate: SSE client disconnected mid-command (%s)", command)
+            return response
+        return web.json_response({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion",
+            "created": int(time.time()), "model": self._model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": result_text},
+                         "finish_reason": "stop"}],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "hermes_command": meta,
+        })
 
     async def _handle_zelda_command_dispatch(
             self, request: "web.Request", *, command: str, cmd_def, session_id: str,
