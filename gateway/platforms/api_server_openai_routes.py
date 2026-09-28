@@ -1000,10 +1000,10 @@ class OpenAICompatRoutesMixin:
                 if not _steer_arg:
                     return await self._handle_zelda_steer(
                         request, session_id=session_id, gateway_session_key=gateway_session_key,
-                        chat_steer_text="")
+                        chat_steer_text="", stream=stream)
                 return await self._handle_zelda_steer(
                     request, session_id=session_id, gateway_session_key=gateway_session_key,
-                    chat_steer_text=_steer_arg)
+                    chat_steer_text=_steer_arg, stream=stream)
         # ZELDA FORK (2026-09-26): generic slash gate — the same shape as the TUI/Desktop
         # ``slash.exec`` surface. A fork message whose FIRST token resolves in the live
         # COMMAND_REGISTRY dispatches into the real gateway handler on THIS topic's session
@@ -1792,7 +1792,8 @@ class OpenAICompatRoutesMixin:
 
     async def _handle_zelda_steer(self, request: "web.Request", *, session_id: str,
                                   gateway_session_key: Optional[str],
-                                  chat_steer_text: Optional[str] = None) -> "web.Response":
+                                  chat_steer_text: Optional[str] = None,
+                                  stream: bool = False) -> "web.Response":
         """Sinda /steer: inject guidance into the LIVE run on this topic's session.
 
         POST /api/commands steers the gateway session-KEY lane, which an id-addressed
@@ -1857,6 +1858,36 @@ class OpenAICompatRoutesMixin:
                 f"Run {run_id} did not accept steer text.",
                 409, code="steer_not_accepted")
         logger.info("Zelda fork /steer: session %s -> run %s accepted", resolved, run_id)
+        if stream:
+            # ZELDA FORK P2.2 parity (2026-09-28): Telegram answers a steer with the
+            # "⏩ Steered into current run…" busy-mode notice (run_busy.py line ~746).
+            # The fork's chat-route steer IS an SSE turn, so reply with the same notice
+            # as a normal content delta (hint-chunk shape, clarify intercept pattern) —
+            # the fork renders it as its own bubble with zero app changes. A bare JSON
+            # 200 is invisible to the fork's SSE consumer (silent steer, live 10:49).
+            from gateway.platforms.api_server import _sse_frame as _sse_frame_zelda
+            _meta = {"object": "hermes.command.result", "command": "steer",
+                     "handled": True, "status": "ok", "result": None,
+                     "sessionId": session_id, "runId": run_id}
+            _completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            _created = int(time.time())
+            response = await self._prepare_sse_response(request, session_id, gateway_session_key)
+
+            def _steer_chunk(delta, finish_reason=None, **extra):
+                return {"id": _completion_id, "object": "chat.completion.chunk",
+                        "created": _created, "model": self._model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+            try:
+                await response.write(_sse_frame_zelda(_steer_chunk({"role": "assistant"})))
+                await response.write(_sse_frame_zelda(
+                    _steer_chunk({"content": "⏩ Steered into current run. Your message arrives after the next tool call."})))
+                await response.write(_sse_frame_zelda(_steer_chunk({}, "stop", usage={
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    **{"hermes_command": _meta})))
+                await response.write(b"data: [DONE]\n\n")
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                logger.info("zelda steer ack: SSE client disconnected")
+            return response
         return web.json_response({
             "object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
