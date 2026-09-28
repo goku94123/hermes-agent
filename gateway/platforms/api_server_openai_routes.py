@@ -999,9 +999,11 @@ class OpenAICompatRoutesMixin:
                         "Send the image without /steer, or wait for the current reply to finish.")
                 if not _steer_arg:
                     return await self._handle_zelda_steer(
-                        request, session_id=session_id, gateway_session_key=gateway_session_key)
+                        request, session_id=session_id, gateway_session_key=gateway_session_key,
+                        chat_steer_text="")
                 return await self._handle_zelda_steer(
-                    request, session_id=session_id, gateway_session_key=gateway_session_key)
+                    request, session_id=session_id, gateway_session_key=gateway_session_key,
+                    chat_steer_text=_steer_arg)
         # ZELDA FORK (2026-09-26): generic slash gate — the same shape as the TUI/Desktop
         # ``slash.exec`` surface. A fork message whose FIRST token resolves in the live
         # COMMAND_REGISTRY dispatches into the real gateway handler on THIS topic's session
@@ -1789,7 +1791,8 @@ class OpenAICompatRoutesMixin:
     # -- ZELDA FORK: /steer parity for the id-addressed Signal fork (Sinda) --------------
 
     async def _handle_zelda_steer(self, request: "web.Request", *, session_id: str,
-                                  gateway_session_key: Optional[str]) -> "web.Response":
+                                  gateway_session_key: Optional[str],
+                                  chat_steer_text: Optional[str] = None) -> "web.Response":
         """Sinda /steer: inject guidance into the LIVE run on this topic's session.
 
         POST /api/commands steers the gateway session-KEY lane, which an id-addressed
@@ -1808,12 +1811,17 @@ class OpenAICompatRoutesMixin:
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        steer_text = ""
         try:
             body = await request.json()
+            steer_text = str(body.get("input") or body.get("message") or body.get("text") or "").strip()
         except Exception:
-            return _error_response("Invalid JSON", 400)
-
-        steer_text = str(body.get("input") or body.get("message") or body.get("text") or "").strip()
+            steer_text = ""
+        if not steer_text and chat_steer_text:
+            # Chat-route /steer (the fork's SSE turn carries the command as the message
+            # body — there is no JSON input key). The original request-body read returned
+            # 400 invalid_steer_input for every chat-route steer (2026-09-28, live).
+            steer_text = chat_steer_text.strip()
         if not steer_text:
             return _error_response(
                 "Missing non-empty steer text; expected 'input', 'message', or 'text'.",
