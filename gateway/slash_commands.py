@@ -1335,6 +1335,71 @@ class GatewaySlashCommandsMixin(
     _STOPLOCAL_SCRIPT = Path.home() / ".hermes" / "scripts" / "llama-unstick.sh"
     _STOPLOCAL_TIMEOUT_S = 300  # reboot = systemd restart + cold model load + 3 verification tests
 
+    # ------------------------------------------------------------------ /fix
+    _FIX_SCRIPT = Path.home() / ".hermes" / "scripts" / "local-fix.sh"
+
+    async def _handle_fix_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+        """Handle /fix — zero-LLM self-repair of the local AI stack.
+
+        ``/fix`` (no arg) = restore last verified snapshot + verify.
+        ``/fix verify|snapshot|diff|status`` = single read-only or capture operation.
+        The long operations run under systemd-run --user (survives gateway restarts,
+        outside the gateway cgroup) and report through the telegram-send fan-out;
+        the ack returns immediately. Mirrors /stoplocal's contract, which this
+        handler fixes in passing: stoplocal reboot/unstick acked but never ran
+        its script (regression from the Sep 24 fork commit).
+        """
+        arg = (event.get_command_args().strip().lower() or "fix")
+        if arg not in ("fix", "verify", "snapshot", "diff", "status"):
+            return (f"Unknown /fix arg `{arg}` — use nothing (full restore), "
+                    f"`verify`, `snapshot`, `diff` or `status`.")
+        if not self._FIX_SCRIPT.exists():
+            return f"✗ Script not found: {self._FIX_SCRIPT}"
+
+        ack = {
+            "fix": "🩹 /fix — restoring last verified snapshot + verify. Report in ~5 min (no LLM involved).",
+            "verify": "🔍 /fix verify — running the proof battery. Report in ~2-3 min.",
+            "snapshot": "💾 /fix snapshot — capturing known-good state. Report in ~3 min.",
+            "diff": "🧾 /fix diff — comparing current state vs last verified snapshot. Report in ~1 min.",
+            "status": None,  # fast, run inline
+        }[arg]
+
+        if arg == "status":
+            def _status():
+                import subprocess
+                return subprocess.run(
+                    ["bash", str(self._FIX_SCRIPT), "status"],
+                    capture_output=True, text=True, timeout=60,
+                ).stdout.strip() or "no snapshots yet"
+            return await self._run_in_executor_with_context(_status)
+
+        def _spawn():
+            import subprocess, time
+            unit = f"local-fix-{int(time.time())}"
+            subprocess.run(
+                ["systemd-run", "--user", "--unit", unit,
+                 "bash", str(self._FIX_SCRIPT), arg],
+                capture_output=True, text=True, timeout=30,
+            )
+            return (f"{ack}\nunit: {unit}.service — survives gateway restarts; "
+                    f"report arrives via the alert fan-out when done.")
+
+        adapter = self.adapters.get(event.source.platform) if getattr(self, "adapters", None) else None
+        try:
+            msg = await self._run_in_executor_with_context(_spawn)
+        except Exception as e:
+            return f"✗ /fix failed to spawn: {e}"
+        if adapter and arg in ("fix", "verify", "snapshot"):
+            try:
+                await adapter.send(
+                    str(event.source.chat_id), msg,
+                    metadata=self._thread_metadata_for_source(event.source),
+                )
+            except Exception as e:
+                logger.warning("fix ack send failed: %s", e)
+            return ""
+        return msg
+
     async def _handle_stoplocal_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /stoplocal — reboot or unstick the local llama-swap model server.
 
@@ -1376,7 +1441,11 @@ class GatewaySlashCommandsMixin(
                     )
                 except Exception as e:
                     logger.warning("stoplocal ack send failed: %s", e)
-            return ""
+            # 2026-09-29 FIX: this branch previously returned "" without ever
+            # running the script — /stoplocal reboot|unstick acked and did
+            # NOTHING (regression since the Sep 24 fork commit). Run it and
+            # return the verdict; the gateway delivers it as a follow-up.
+            return await self._run_in_executor_with_context(_run)
         return await self._run_in_executor_with_context(_run)
 
 
