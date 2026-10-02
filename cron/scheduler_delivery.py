@@ -12,13 +12,16 @@ import asyncio
 import concurrent.futures
 import contextlib
 import contextvars
+import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional
 
 
@@ -31,7 +34,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao"})
+    "qqbot", "yuanbao", "zelda"})
 
 # Gateway platforms whose adapter declares ``supports_async_delivery = False`` (request/response
 # only, ``send()`` is a stub) — a cron report can never reach them, so they are never a
@@ -1844,6 +1847,43 @@ def _deliver_standalone(
         enabled=t.mirror_this_target)
 
 
+def _deliver_zelda_target(
+    job: dict, cleaned_text: str, media_files: list, *, target_errors: list,
+    delivery_errors: list,
+) -> bool:
+    """ZELDA fork delivery lane (2026-10-02): stage the report into the fork's push
+    queue (~/.hermes/zelda-outbound/.push-queue/) as a NOTICE row — the same contract
+    the alert fan-out (zelda-alert.sh) uses, which the fork has rendered reliably since
+    hf47. The api_server adapter is request/response only (send() is a stub), so the
+    live/standalone lanes can never reach Sinda; the queue IS the transport.
+
+    Row shape (gateway zelda_notices.py contract): {"text", "notice", "ts", "sessions"}.
+    Empty sessions → broadcast → the pinned Hermes Notifications board. A run's media
+    (attachments) cannot ride a text row: recorded as a delivery error, visible in the
+    run receipt. Returns True when a row was staged."""
+    qdir = Path.home() / ".hermes" / "zelda-outbound" / ".push-queue"
+    try:
+        qdir.mkdir(parents=True, exist_ok=True)
+        row = {
+            "text": cleaned_text,
+            "notice": "cron",
+            "ts": int(time.time()),
+            "sessions": [],  # broadcast → Notifications board
+        }
+        job_id = f"cron-{job.get('id', 'x')}-{int(time.time())}-{os.urandom(3).hex()}"
+        (qdir / f"{job_id}.json").write_text(json.dumps(row))
+        logger.info("Job '%s': staged zelda push row %s (%d chars)",
+                    job.get("id", "?"), job_id, len(cleaned_text))
+        if media_files:
+            delivery_errors.append(
+                f"{len(media_files)} media attachment(s) not deliverable to zelda "
+                f"(text-only NOTICE rows) — files: {', '.join(str(m) for m in media_files[:3])}")
+        return True
+    except Exception as exc:
+        target_errors.append(f"zelda push-queue staging failed: {exc}")
+        return False
+
+
 def _prepare_target_delivery(
     job: dict, target: dict, *, adapters, loop, config, notify_delivery: bool, mirror_enabled: bool,
     mirror_text: str, delivery_errors: list,
@@ -2098,6 +2138,24 @@ def _deliver_result(
                     delivery_errors.append(bot_chat_error)
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            continue
+
+        # ZELDA fork lane (2026-10-02): stage a NOTICE push row — no adapter exists
+        # (api_server is request/response only), so the live/standalone lanes below
+        # can never reach Sinda. Runs BEFORE _prepare_target_delivery, which would
+        # drop an unknown platform with no adapter. A staging failure IS a delivery
+        # failure: surfaced directly in delivery_errors.
+        if str(target.get("platform") or "").lower() == "zelda":
+            _zelda_stage_errors: list = []
+            try:
+                _zelda_staged = _deliver_zelda_target(
+                    job, cleaned_delivery_content, media_files,
+                    target_errors=_zelda_stage_errors, delivery_errors=delivery_errors)
+            except Exception as exc:  # one lane must never kill the delivery loop
+                _zelda_stage_errors.append(f"zelda push-queue staging crashed: {exc}")
+                _zelda_staged = False
+            if not _zelda_staged:
+                delivery_errors.extend(_zelda_stage_errors)
             continue
 
         t = _prepare_target_delivery(
