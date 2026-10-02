@@ -1009,28 +1009,76 @@ class OpenAICompatRoutesMixin:
                     stream=stream)
         # ZELDA FORK: /steer parity - steer the LIVE run on THIS topic's session id
         # (POST /api/commands steers a phantom session-key the id-addressed fork never
-        # uses). Only a plain-text first part qualifies: agent.steer() is text-only, so
-        # a media+/steer send is rejected explicitly instead of losing the image.
-        if (request.headers.get("X-Zelda-Client", "").strip() == "1" and provided_session_id
-                and isinstance(user_message, str)):
-            _steer_head = user_message.strip().lower().split(maxsplit=1)[0]
+        # uses). The head token may ride a PARTS-ARRAY user_message (media + caption):
+        # read the /steer token from the text part in that case (hf49, 2026-10-02 —
+        # pre-hf49 the isinstance(str) guard made image+/steer fall through as a plain
+        # turn and the steer never injected). Media semantics (Telegram-parity, nothing
+        # lost): IDLE session → strip the /steer token and fall through as a NORMAL
+        # media turn (the image reaches the model whole). RUNNING session → agent.steer()
+        # is text-only, so image bytes are staged to disk and the steer carries the
+        # caption + the staged path (the running agent reads the file after the tool
+        # batch) — the image is never dropped, matching Telegram's queue-demote intent.
+        if (request.headers.get("X-Zelda-Client", "").strip() == "1" and provided_session_id):
+            _steer_head_src = user_message if isinstance(user_message, str) else " ".join(
+                str(p.get("text") or "") for p in (user_message or [])
+                if isinstance(p, dict) and p.get("type") == "text")
+            _steer_head = _steer_head_src.strip().lower().split(maxsplit=1)[0] if _steer_head_src.strip() else ""
             if _steer_head == "/steer":
-                _steer_arg = user_message.strip().split(maxsplit=1)[1].strip() if len(user_message.strip().split(maxsplit=1)) > 1 else ""
+                _steer_arg = _steer_head_src.strip().split(maxsplit=1)[1].strip() if len(_steer_head_src.strip().split(maxsplit=1)) > 1 else ""
                 _user_parts = conversation_messages[-1].get("content") if conversation_messages else None
-                _has_media = isinstance(_user_parts, list) and any(
-                    isinstance(p, dict) and p.get("type") in ("image_url", "input_image", "input_audio")
-                    for p in _user_parts if isinstance(p, dict))
-                if _has_media:
-                    return _invalid_request(
-                        "/steer is text-only - media can't be steered into a running turn. "
-                        "Send the image without /steer, or wait for the current reply to finish.")
-                if not _steer_arg:
+                _media_parts = [p for p in (_user_parts or []) if isinstance(p, dict) and p.get("type") in ("image_url", "input_image", "input_audio")] if isinstance(_user_parts, list) else []
+                if _media_parts:
+                    from gateway.platforms.api_server_runs import _resolve_live_session_id as _steer_resolve
+                    try:
+                        _steer_resolved = await _steer_resolve(self, session_id)
+                    except Exception:
+                        _steer_resolved = session_id
+                    _steer_live = any(
+                        st.get("session_id") == _steer_resolved and st.get("status") == "running"
+                        for st in self._run_statuses.values())
+                    if not _steer_live:
+                        # IDLE: become a normal media turn — strip the command token from
+                        # the text part (user_message aliases the same list) and fall through.
+                        for p in _user_parts:
+                            if isinstance(p, dict) and p.get("type") == "text":
+                                p["text"] = _steer_arg
+                        logger.info("Zelda fork /steer+media on idle session %s: delivered as a normal media turn", session_id)
+                    else:
+                        # RUNNING: stage image bytes, steer text-only with the paths.
+                        import base64 as _b64
+                        from pathlib import Path as _P
+                        _stage_dir = _P.home() / ".hermes" / "cache" / "zelda-inbound"
+                        _stage_dir.mkdir(parents=True, exist_ok=True)
+                        _paths = []
+                        for p in _media_parts:
+                            _url = str(((p.get("image_url") or {}) if isinstance(p, dict) else {}).get("url") or "")
+                            if _url.startswith("data:") and ";base64," in _url:
+                                _hdr, _b64data = _url.split(";base64,", 1)
+                                _ext = "jpg" if "jpeg" in _hdr or "jpg" in _hdr else ("png" if "png" in _hdr else "bin")
+                                _f = _stage_dir / f"steer-{int(time.time())}-{len(_paths)}.{_ext}"
+                                try:
+                                    _f.write_bytes(_b64.b64decode(_b64data))
+                                    _paths.append(str(_f))
+                                except Exception:
+                                    logger.warning("zelda steer+media: failed to stage one image part", exc_info=True)
+                        _steer_body = _steer_arg or "(see staged image)"
+                        if _paths:
+                            _steer_body += "\n[image(s) staged: " + ", ".join(_paths) + " — view with your vision tools after this tool batch]"
+                        if _steer_body.strip():
+                            return await self._handle_zelda_steer(
+                                request, session_id=session_id, gateway_session_key=gateway_session_key,
+                                chat_steer_text=_steer_body, stream=stream)
+                        # Nothing steerable (no caption AND staging failed): reject explicitly.
+                        return _invalid_request(
+                            "/steer with media could not stage the attachment — send the image without /steer.")
+                elif not _steer_arg:
                     return await self._handle_zelda_steer(
                         request, session_id=session_id, gateway_session_key=gateway_session_key,
                         chat_steer_text="", stream=stream)
-                return await self._handle_zelda_steer(
-                    request, session_id=session_id, gateway_session_key=gateway_session_key,
-                    chat_steer_text=_steer_arg, stream=stream)
+                else:
+                    return await self._handle_zelda_steer(
+                        request, session_id=session_id, gateway_session_key=gateway_session_key,
+                        chat_steer_text=_steer_arg, stream=stream)
         # ZELDA FORK (2026-09-26): generic slash gate — the same shape as the TUI/Desktop
         # ``slash.exec`` surface. A fork message whose FIRST token resolves in the live
         # COMMAND_REGISTRY dispatches into the real gateway handler on THIS topic's session
