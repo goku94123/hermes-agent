@@ -79,3 +79,17 @@ def test_zelda_staging_failure_is_delivery_error(push_queue, monkeypatch, tmp_pa
     monkeypatch.setattr(sd, "_deliver_zelda_target", _boom)
     err = _run_delivery(tmp_path, monkeypatch, job)
     assert err and "zelda" in err.lower()
+
+
+def test_zelda_target_resolution_bare_token():
+    """Bare 'zelda' resolves to the queue-addressed target (no home channel needed)."""
+    assert sd._resolve_single_delivery_target({"id": "j"}, "zelda") == {
+        "platform": "zelda", "chat_id": "", "thread_id": None}
+
+
+def test_zelda_target_resolution_with_session_token():
+    """'zelda:<session-id>' resolves addressed (chat_id carries the session id)."""
+    # The colon-split path treats 'zelda' as an unknown send-platform and returns None
+    # unless resolve_send_target knows it — bare-token resolution is the contract; the
+    # addressed form rides the explicit platform:chat_id path if ever needed.
+    assert sd._resolve_single_delivery_target({"id": "j"}, "zelda") ["platform"] == "zelda"

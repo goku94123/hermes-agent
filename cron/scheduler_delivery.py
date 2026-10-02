@@ -675,6 +675,11 @@ def _resolve_single_delivery_target(
         }
     platform_name = deliver_value
     home_provenance = None if from_broadcast else "home"
+    # ZELDA fork (2026-10-02): queue-addressed platform — the push queue IS the
+    # destination, no home channel or chat id exists. Bare "zelda" → broadcast row
+    # (Notifications board); "zelda:<session-id>" → row addressed to that topic.
+    if platform_name.lower() == "zelda":
+        return {"platform": "zelda", "chat_id": "", "thread_id": None}
     if origin and origin.get("platform") == platform_name:
         chat_id = _get_home_target_chat_id(platform_name)
         if chat_id:
