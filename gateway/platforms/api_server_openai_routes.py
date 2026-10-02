@@ -1146,10 +1146,18 @@ class OpenAICompatRoutesMixin:
                 logger.debug("zelda clarify intercept: registry unavailable", exc_info=True)
                 _pending = None
             if _pending is not None:
-                _outcome = _clarify_mod.attempt_text_response_for_session(session_id, user_message.strip())
+                # ZELDA (2026-10-02): a pre-hf48 fork tap sends the RAW action
+                # ("zelda://answer/Coffee") — strip the scheme so the choice-coercion
+                # matches the label and the tool result carries the bare answer,
+                # not the polluted string (hf46 shipped this bug; resolve as prose
+                # used to file "zelda://answer/Coffee" in as the user's words).
+                _tap = user_message.strip()
+                if _tap.startswith("zelda://answer/"):
+                    _tap = _tap[len("zelda://answer/"):].strip()
+                _outcome = _clarify_mod.attempt_text_response_for_session(session_id, _tap)
                 if _outcome == _clarify_mod.TEXT_REJECTED_PROSE:
                     # Prose on a choice prompt = "Other": resolve with the user's words.
-                    if _clarify_mod.resolve_gateway_clarify(_pending.clarify_id, user_message.strip()):
+                    if _clarify_mod.resolve_gateway_clarify(_pending.clarify_id, _tap):
                         _outcome = _clarify_mod.TEXT_RESOLVED
                 if _outcome == _clarify_mod.TEXT_RESOLVED:
                     logger.info("Zelda fork clarify answered (session=%s, id=%s)",
