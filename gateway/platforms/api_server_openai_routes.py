@@ -910,6 +910,9 @@ class OpenAICompatRoutesMixin:
                 "tell him it is pushed — the Sinda app polls /v1/zelda/push and downloads "
                 "it natively. Do NOT append a `zeldafile://` marker; that legacy path is "
                 "retired.\n"
+                "- Voice replies: when OJ asks for a voice note (or audio clearly fits), "
+                "generate it with the text_to_speech tool, then stage the audio file with "
+                "zelda-push.sh — Sinda renders pushed audio as a playable voice bubble.\n"
                 "- Do not mention Telegram and do not write anything 'to Telegram' unless "
                 "OJ explicitly asks for a Telegram copy."
             )
