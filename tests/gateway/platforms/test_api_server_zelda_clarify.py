@@ -218,8 +218,13 @@ class TestZeldaClarifyCallback:
             cg.resolve_gateway_clarify(payloads[0]["clarifyId"], "Option B")
 
         threading.Thread(target=_resolver, daemon=True).start()
-        answer = cb("Pick a lane", ["Option A", "Option B"])
-        assert answer == "Option B"
+        # tools.clarify_tool contract (#127760): the callback receives the NORMALIZED
+        # questions list and returns the {"answers", "outcome"} reply dict.
+        questions = [{"qid": "q0", "question": "Pick a lane",
+                      "choices": ["Option A", "Option B"], "choices_offered": ["Option A", "Option B"],
+                      "multi_select": False}]
+        reply = cb(questions)
+        assert reply == {"answers": {"q0": "Option B"}, "outcome": "submitted"}
         assert payloads and payloads[0]["question"] == "Pick a lane"
         assert payloads[0]["choices"] == ["Option A", "Option B"]
         assert payloads[0]["multiSelect"] is False
@@ -228,7 +233,7 @@ class TestZeldaClarifyCallback:
         assert cg.get_pending_for_session(SINDA_ID, include_choice_prompts=True) is None
 
     def test_sentinel_on_empty_wake(self, zelda_env):
-        """A boundary clear ("" wake) yields the did-not-respond sentinel, not ""."""
+        """A boundary clear (clear_session wake) maps to outcome=cancelled, not timed_out."""
         from tools import clarify_gateway as cg
 
         store, adapter, runner = zelda_env
@@ -237,15 +242,57 @@ class TestZeldaClarifyCallback:
         gate = threading.Event()
 
         def _clearer():
-            while not payloads:
+            while not cg.has_pending(SINDA_ID):
                 if gate.wait(timeout=0.05):
                     break
             cg.clear_session(SINDA_ID)
 
         threading.Thread(target=_clearer, daemon=True).start()
-        answer = cb("Still there?", None)
-        assert answer.startswith("[user did not respond within")
+        questions = [{"qid": "q0", "question": "Still there?", "choices": None,
+                      "choices_offered": None, "multi_select": False}]
+        reply = cb(questions)
+        assert reply["outcome"] == "cancelled"
+        assert reply["answers"] == {}
+        assert "cancel" in reply["notice"].lower()
         assert cg.get_pending_for_session(SINDA_ID, include_choice_prompts=True) is None
+
+    def test_batch_stops_at_first_unanswered(self, zelda_env):
+        """Batch form: the unanswered tail is OMITTED from answers (renders unanswered);
+        earlier answers are kept."""
+        from tools import clarify_gateway as cg
+
+        store, adapter, runner = zelda_env
+        payloads = []
+        cb = self._cb(adapter, payloads)
+        gate = threading.Event()
+
+        def _clearer():
+            # Wake the SECOND registration with a boundary clear (mid-batch cancel).
+            # payloads[1] exists only after register(q1) (notify runs post-registration),
+            # so this cannot race the register/clear pair.
+            while len(payloads) < 2:
+                if gate.wait(timeout=0.05):
+                    break
+            cg.clear_session(SINDA_ID)
+
+        threading.Thread(target=_clearer, daemon=True).start()
+
+        def _answer_first():
+            while not payloads:
+                if gate.wait(timeout=0.05):
+                    break
+            cg.resolve_gateway_clarify(payloads[0]["clarifyId"], "Coffee")
+
+        threading.Thread(target=_answer_first, daemon=True).start()
+        questions = [
+            {"qid": "q0", "question": "Tea or coffee?", "choices": ["Tea", "Coffee"],
+             "choices_offered": ["Tea", "Coffee"], "multi_select": False},
+            {"qid": "q1", "question": "Sugar?", "choices": None,
+             "choices_offered": None, "multi_select": False}]
+        reply = cb(questions)
+        assert reply["outcome"] == "cancelled"
+        assert reply["answers"] == {"q0": "Coffee"}
+        assert "cancel" in reply["notice"].lower()
 
 
 class TestClarifyAnswerIntercept:

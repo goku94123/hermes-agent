@@ -4611,44 +4611,62 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         with "" -> same sentinel. Batch form mirrors TurnRunner: one registration per
         question, stop at the first the user never answers, JSON payload back.
         """
-        def _clarify_callback(question, choices, multi_select=False, questions=None):
+        def _clarify_callback(questions):
+            """tools.clarify_tool contract (upstream #127760, one shape on every surface):
+            called with the NORMALIZED questions list, returns ``{"answers": {qid: raw},
+            "outcome": submitted|timed_out}``. Unanswered tail questions are OMITTED from
+            ``answers`` (the tool renders them ``unanswered``). Per question: register the
+            pending prompt in ``tools.clarify_gateway`` under the caller's session id,
+            stream it via ``notify`` (the SSE writer turns the payload into
+            ``event: hermes.clarify``), then block until a chat-turn answer resolves it
+            (the fork path's intercept) or the configured timeout fires. Timeout/"" wake
+            maps to the timeout sentinel (did-not-respond notice), keeping the
+            "[user did not respond...]" shape the fork sheet never sees.
+            """
             from tools import clarify_gateway as _clarify_mod
-            if questions:
-                answers = {}
-                timed_out = False
-                notice = None
-                for _idx, _entry in enumerate(questions):
-                    # Recursive call returns the user's reply STRING (or the timeout sentinel) —
-                    # never a 2-tuple. Unpacking it blew up ("too many values to unpack") on the
-                    # first real batch question (hf40 verify, session probe_fa426da660).
-                    _raw = _clarify_callback(
-                        _entry.get("question", ""), _entry.get("choices"),
-                        bool(_entry.get("multi_select")))
-                    _answered = not (_raw is None or (isinstance(_raw, str) and _raw.startswith("[user did not respond")))
-                    if not _answered:
-                        timed_out = True
-                        notice = _raw
-                        break
-                    answers[_entry.get("qid") or f"q{_idx}"] = _raw
-                return json.dumps({"answers": answers, "timed_out": timed_out,
-                                   **({"notice": notice} if notice else {})},
-                                  ensure_ascii=False)
-            _clarify_id = uuid.uuid4().hex[:10]
-            _safe_choices = list(choices) if choices else None
-            _timeout_s = float(_clarify_mod.get_clarify_timeout())
-            _clarify_mod.register(clarify_id=_clarify_id, session_key=session_key,
-                                  question=question, choices=_safe_choices,
-                                  multi_select=bool(multi_select))
-            try:
-                notify({"clarifyId": _clarify_id, "question": question,
-                        "choices": _safe_choices, "multiSelect": bool(multi_select),
-                        "sessionId": session_key})
-                _response = _clarify_mod.wait_for_response(_clarify_id, timeout=_timeout_s)
-            finally:
-                _clarify_mod.clear_session(session_key)
-            if _response is None or _response == "":
-                return f"[user did not respond within {int(_timeout_s / 60)}m]"
-            return str(_response)
+            answers = {}
+            timed_out = False
+            cancelled = False
+            notice = None
+            for _idx, _entry in enumerate(questions):
+                _question = _entry.get("question", "")
+                _choices = _entry.get("choices")
+                _multi = bool(_entry.get("multi_select"))
+                _clarify_id = uuid.uuid4().hex[:10]
+                _timeout_s = float(_clarify_mod.get_clarify_timeout())
+                _clarify_mod.register(clarify_id=_clarify_id, session_key=session_key,
+                                      question=_question, choices=_choices,
+                                      multi_select=_multi)
+                try:
+                    notify({"clarifyId": _clarify_id, "question": _question,
+                            "choices": _choices, "multiSelect": _multi,
+                            "sessionId": session_key})
+                    _response = _clarify_mod.wait_for_response(_clarify_id, timeout=_timeout_s)
+                finally:
+                    _clarify_mod.clear_session(session_key)
+                if _response is None:
+                    # Genuine timeout.
+                    timed_out = True
+                    notice = f"[user did not respond within {int(_timeout_s / 60)}m]"
+                    break
+                if _response == _clarify_mod.CANCELLED:
+                    # Boundary clear (/new, shutdown, cached-agent eviction): stop the batch.
+                    cancelled = True
+                    notice = "[clarify cancelled: session boundary cleared]"
+                    break
+                if _response == _clarify_mod.SKIPPED:
+                    # User moved on: qid present with a null answer -> tool renders "skipped".
+                    answers[_entry.get("qid") or f"q{_idx}"] = None
+                    continue
+                answers[_entry.get("qid") or f"q{_idx}"] = str(_response)
+            if cancelled:
+                outcome = "cancelled"
+            elif timed_out:
+                outcome = "timed_out"
+            else:
+                outcome = "submitted"
+            return {"answers": answers, "outcome": outcome,
+                    **({"notice": notice} if notice else {})}
         return _clarify_callback
 
     async def _run_agent(
