@@ -208,7 +208,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5",
         "kimi-k2-thinking", "kimi-k2-turbo-preview", "kimi-k2-0905-preview",
     ],
-    "stepfun": ["step-3.5-flash", "step-3.5-flash-2603"],
+    "stepfun": ["step-3.7-flash", "step-3.5-flash", "step-3.5-flash-2603"],
     "moonshot": [
         "kimi-k3", "kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview", "kimi-k2-0905-preview",
     ],
@@ -375,7 +375,11 @@ _canonical_slugs = {p.slug for p in CANONICAL_PROVIDERS}
 
 
 def _plugin_provider_enters_picker(pp) -> bool:
-    """Picker admission for a plugin model-provider profile: any slug without a built-in row."""
+    """Picker admission for a plugin model-provider profile: any slug without a built-in row.
+
+    Every profile is admitted, hidden (pre-release) ones included: ``CANONICAL_PROVIDERS`` is also
+    the typed-path registry (``provider:model`` parsing, labels), so a signed-in user must still be
+    able to name one. The pickers that list rows filter with ``providers.provider_listed``."""
     return pp.name not in _canonical_slugs
 
 
@@ -409,6 +413,15 @@ def sync_plugin_provider_catalog() -> int:
 _PROVIDER_LABELS: dict[str, str] = {p.slug: p.label for p in CANONICAL_PROVIDERS}
 _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
 sync_plugin_provider_catalog()
+
+
+def listed_canonical_providers() -> list[ProviderEntry]:
+    """``CANONICAL_PROVIDERS`` minus pre-release profiles the user has not opted into: what a provider
+    LIST offers. Typed paths (``provider:model``, labels, ``--provider``) keep the full table."""
+    from hermes_cli import models  # the binding every list consumer read before this filter existed
+    from providers import unlisted_provider_names
+    hidden = unlisted_provider_names()
+    return [p for p in models.CANONICAL_PROVIDERS if p.slug not in hidden]
 
 
 # ---------------------------------------------------------------------------

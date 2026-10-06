@@ -897,7 +897,7 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             from agent.moa_loop import bind_moa_runtime
             bind_moa_runtime(agent, _fb["model"])
             return None
-        agent.provider = _fb["provider"]
+        agent.provider = agent.requested_provider = _fb["provider"]
         agent.model = _fb_model or _fb["model"]
         return _client_kwargs_from_routed(_fb_client, _provider_timeout)
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,
@@ -1121,6 +1121,10 @@ def _init_fallback_chain(agent, fallback_model):
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
+    # A feature that left core for a catalog plugin (Home Assistant) is installed for a home that
+    # used it, once per process, before discovery so its tools are in this agent's snapshot.
+    from hermes_cli.left_core_migration import recover_at_startup
+    recover_at_startup(say=getattr(agent, "_emit_startup_warning", None))
     # A multiplexed gateway may have switched HERMES_HOME since model_tools was imported;
     # make sure this profile's plugins are discovered before the tool snapshot.
     try:

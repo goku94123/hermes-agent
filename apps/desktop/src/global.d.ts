@@ -7,6 +7,7 @@ import type { HudModifierApi } from '../electron/hud-modifier-types'
 import type { MachineProfile } from '../electron/machine-profile'
 import type { HermesNotification } from '../electron/notification-types'
 import type { PoolLimits } from '../electron/pool-limits'
+import type { KeepAwakeMode } from '../electron/power-save'
 import type { UpdateRunReport } from '../electron/updater/update-metrics'
 import type { GrowRequest } from '../electron/window-growth'
 
@@ -387,7 +388,7 @@ declare global {
       /** Sanitized local `display.skin`, available before any gateway connects. */
       localSkin?: { profile: string; skin: HermesSkin } | null
       setTranslucency?: (payload: TranslucencyState) => void
-      setKeepAwake?: (on: boolean) => void
+      setKeepAwake?: (mode: KeepAwakeMode) => void
       minimizeToTray?: {
         get: () => Promise<{ enabled: boolean; available: boolean }>
         set: (on: boolean) => Promise<{ enabled: boolean; available: boolean }>
@@ -1092,6 +1093,7 @@ export interface DesktopConnectionTestResult {
     | 'auth-failed'
     | 'hermes-not-found'
     | 'host-key-changed'
+    | 'interactive-auth'
     | 'timeout'
     | 'unreachable'
     | 'unsupported-platform'
@@ -1230,6 +1232,8 @@ export interface DesktopManagedUpdateReceipt {
   preVersion?: string
   postVersion?: string
   stopReason?: string
+  followups?: Array<{ step: string; reason: string }>
+  userAction?: { step: string; reason: string } | null
 }
 
 export interface DesktopManagedConnectionUpdateResult {
@@ -1242,6 +1246,8 @@ export interface DesktopManagedConnectionUpdateResult {
   exitCode: number | null
   receipt: DesktopManagedUpdateReceipt | null
   scopes: Array<{ profile: string; restored: boolean; error?: string }>
+  /** Post-commit steps a successful update still owes (named in `message`). */
+  owed?: Array<{ step: string; reason: string }>
   error?: string
   message?: string
 }
