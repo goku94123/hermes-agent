@@ -129,6 +129,31 @@ _CEILING_NO_TEXT = (
     "continuation attempt — its reasoning consumed the entire budget each time.\n\nTo fix this:\n"
     "→ Lower reasoning effort: `/reasoning low` or `/reasoning none`\n→ Or raise max_tokens for this model"
 )
+# zelda-trunc-banner: distinguish "reasoning burned the token budget" (raise the cap /
+# lower effort) from "dead/wedged local engine returning ~zero tokens" (self-heal will
+# respawn it — raising max_tokens does nothing). 00:05:14 2026-10-09 incident.
+_ZELDA_WEDGE_NO_TEXT = (
+    "⚠️ **No visible answer was produced.** The model server returned near-zero output on "
+    "every attempt — this looks like a wedged/crashed local engine, not a token-budget "
+    "problem (raising max_tokens won't help).\n\nThe wedge watchdog is armed: it kills and "
+    "respawns the engine within ~10 minutes. Just resend this message in a couple of minutes."
+)
+
+def _zelda_wedge_banner(agent: Any, response: Any) -> str:
+    """Pick the honest no-text banner. Tiny/zero output tokens across a full
+    multi-attempt ceiling exit = the engine never generated (wedge class), not a
+    budget burn (which lands at the cap). Unparseable usage → default banner."""
+    usage = getattr(response, "usage", None)
+    # Only trust real usage shapes (dict or object). Scalars/strings coerce
+    # silently to zero in normalize_usage — that would fake a wedge signal.
+    if not usage or not (isinstance(usage, dict) or hasattr(usage, "__dict__")):
+        return _CEILING_NO_TEXT
+    try:
+        ot = int(normalize_usage(usage, provider=agent.provider, api_mode=agent.api_mode).output_tokens or 0)
+    except Exception:
+        return _CEILING_NO_TEXT
+    return _ZELDA_WEDGE_NO_TEXT if ot <= 16 else _CEILING_NO_TEXT
+
 # Below this many free tokens the prompt itself filled the window: a continuation nudge +
 # fragment costs ~100 tokens per attempt, so retrying only shrinks the room (#106120).
 _MIN_CONTINUATION_HEADROOM = 512
@@ -387,7 +412,7 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
             "Truncated continuation diverged — kept the partial response (no further attempts)",
         )
     return st.end_turn(
-        partial_response or _CEILING_NO_TEXT,
+        partial_response or _zelda_wedge_banner(agent, st.response),  # zelda-trunc-banner
         "Response remained truncated after 4 continuation attempts",
     )
 
