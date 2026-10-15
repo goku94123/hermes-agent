@@ -1246,12 +1246,15 @@ def _route_explicit_provider(st: _Switch) -> Optional[ModelSwitchResult]:
     except AmbiguousAliasError as err:
         return st.fail(_ambiguous_alias_message(err), target_provider=st.target_provider)
     if alias_result is not None:
-        alias_provider, st.new_model, alias_name = alias_result
-        # Adopt the alias (and with it its base_url and key) only when it belongs to the provider
-        # the user named: a reverse model-id match may land on another provider's alias, and
-        # honouring it would send the turn to that provider's endpoint under this one's identity.
+        alias_provider, alias_model, alias_name = alias_result
+        # Adopt the alias (and with it its base url, key, and model name) only when it
+        # belongs to the providerthe usernamed. Areverse model-id match mayland
+        # onanotherprovider'salias (e.g. alocalalias keycollidingwitha real
+        # model id onthe target), andhonouringonlythemodel halfsends
+        # thealias'sforeignmodel idto thisprovider'sendpoint, which 400s.
         if (_provider_identity(alias_provider, st.user_providers, st.custom_providers)
                 == _provider_identity(st.target_provider, st.user_providers, st.custom_providers)):
+            st.new_model = alias_model
             st.resolved_alias = alias_name
     return None
 
